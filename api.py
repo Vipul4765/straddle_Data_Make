@@ -29,11 +29,33 @@ MAX_HISTORY_LIMIT = STRADDLE_API_MAX_HISTORY_LIMIT
 app = FastAPI(title="Straddle Live API", version="1.0.0")
 
 
-def _to_user_payload(payload: dict[str, Any]) -> dict[str, float | None]:
+def _time_from_payload(payload: dict[str, Any]) -> str | None:
+    minute_str = payload.get("minute_str")
+    if minute_str:
+        return str(minute_str)
+
+    minute_int = payload.get("minute_int")
+    if minute_int is None:
+        return None
+
+    try:
+        minute_int_value = int(minute_int)
+    except (TypeError, ValueError):
+        return None
+
+    hour = minute_int_value // 10000
+    minute = (minute_int_value // 100) % 100
+    return f"{hour:02d}:{minute:02d}:00"
+
+
+def _to_user_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    # Keep a stable frontend contract with explicit candle time + publish time.
     return {
         "ce_close": payload.get("ce_close"),
         "pe_close": payload.get("pe_close"),
         "straddle_price": payload.get("straddle_price", payload.get("close")),
+        "time": _time_from_payload(payload),
+        "updated_at_ms": payload.get("updated_at_ms"),
     }
 
 

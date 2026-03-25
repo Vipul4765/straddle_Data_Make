@@ -155,6 +155,18 @@ Endpoints:
 - `GET /straddle/history/{symbol}?limit=20`
 - `GET /straddle/stream/{symbol}` (SSE)
 
+Response shape (current/history item/SSE update):
+
+```json
+{
+  "ce_close": 284.55,
+  "pe_close": 268.5,
+  "straddle_price": 553.05,
+  "time": "10:15:00",
+  "updated_at_ms": 1760000000000
+}
+```
+
 Examples:
 
 ```bash
