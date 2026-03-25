@@ -16,6 +16,7 @@ try:
         REDIS_URL,
         STRADDLE_MAX_HISTORY,
         STRADDLE_POLL_INTERVAL_SECONDS,
+        STRADDLE_STARTUP_BACKFILL_CANDLES,
         STRADDLE_SYMBOLS,
     )
     from .straddle_builder import atm_strike, build_straddle_for_strike
@@ -27,6 +28,7 @@ except ImportError:  # Support direct script execution
         REDIS_URL,
         STRADDLE_MAX_HISTORY,
         STRADDLE_POLL_INTERVAL_SECONDS,
+        STRADDLE_STARTUP_BACKFILL_CANDLES,
         STRADDLE_SYMBOLS,
     )
     from straddle_builder import atm_strike, build_straddle_for_strike
@@ -124,12 +126,14 @@ class SharedStraddleWorker:
         symbols: set[str],
         poll_interval_seconds: float,
         max_history: int,
+        startup_backfill_candles: int,
     ) -> None:
         self.redis_url = redis_url
         self.source_channel = source_channel
         self.symbols = symbols
         self.poll_interval_seconds = poll_interval_seconds
         self.max_history = max_history
+        self.startup_backfill_candles = max(0, startup_backfill_candles)
         self.redis = redis.Redis.from_url(redis_url, decode_responses=True)
         self.segment_wise_contract_dict, _ = contract_file()
         self.latest_event_by_token: dict[str, dict[str, Any]] = {}
@@ -179,7 +183,135 @@ class SharedStraddleWorker:
             self._remember_event(event)
 
         for symbol in sorted(self.symbols):
-            self._maybe_publish_for_symbol(symbol, source="bootstrap")
+            backfilled = self._bootstrap_history_for_symbol(symbol)
+            if backfilled <= 0:
+                self._maybe_publish_for_symbol(symbol, source="bootstrap")
+
+    def _bootstrap_history_for_symbol(self, symbol: str) -> int:
+        minute_values = self._recent_minutes_for_symbol(symbol, self.startup_backfill_candles)
+        if not minute_values:
+            return 0
+
+        encoded_payloads: list[str] = []
+        last_identity: tuple[int, float, str, str] | None = None
+        for minute_int in minute_values:
+            built = self._build_payload_for_symbol_minute(symbol, minute_int, source="startup_backfill")
+            if not built:
+                continue
+
+            payload, identity = built
+            payload["version"] = self.redis.incr(version_key(symbol))
+            encoded_payloads.append(json.dumps(payload, ensure_ascii=True))
+            last_identity = identity
+
+        if not encoded_payloads or not last_identity:
+            return 0
+
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.delete(history_key(symbol))
+        pipe.rpush(history_key(symbol), *encoded_payloads)
+        pipe.set(current_key(symbol), encoded_payloads[-1])
+        pipe.execute()
+
+        self.last_published[symbol] = last_identity
+        print(
+            f"startup_backfill symbol={symbol} candles={len(encoded_payloads)} "
+            f"from={minute_values[0]} to={minute_values[-1]}"
+        )
+        return len(encoded_payloads)
+
+    def _recent_minutes_for_symbol(self, symbol: str, limit: int) -> list[int]:
+        spot_token = SYMBOL_CONFIG[symbol]["pubsub_spot_token"]
+        try:
+            raw_fields = self.redis.hkeys(source_hash_key(spot_token))
+        except redis.RedisError:
+            return []
+
+        minute_values: list[int] = []
+        for raw_field in raw_fields:
+            if raw_field == "__latest__":
+                continue
+            try:
+                minute_value = int(raw_field)
+            except (TypeError, ValueError):
+                continue
+            if minute_value > 0:
+                minute_values.append(minute_value)
+
+        if not minute_values:
+            return []
+        unique_sorted_minutes = sorted(set(minute_values))
+        if limit <= 0:
+            return unique_sorted_minutes
+        return unique_sorted_minutes[-limit:]
+
+    def _build_payload_for_symbol_minute(
+        self,
+        symbol: str,
+        minute_int: int,
+        source: str,
+    ) -> tuple[dict[str, Any], tuple[int, float, str, str]] | None:
+        config = SYMBOL_CONFIG[symbol]
+        spot_event = self._load_leg_event(config["pubsub_spot_token"], minute_int)
+        if not spot_event:
+            return None
+
+        selected = self._select_exact_atm_strike(symbol, spot_event["close"], minute_int)
+        if not selected:
+            return None
+        requested_atm_strike, selection, ce_event, pe_event = selected
+
+        ce_pubsub_token = f"{selection.fo_segment}:{selection.ce_exchange_token}"
+        pe_pubsub_token = f"{selection.fo_segment}:{selection.pe_exchange_token}"
+
+        identity = (
+            minute_int,
+            selection.strike,
+            selection.ce_exchange_token,
+            selection.pe_exchange_token,
+        )
+        ce_carry_forward = ce_event["minute_int"] != minute_int
+        pe_carry_forward = pe_event["minute_int"] != minute_int
+        payload = {
+            "symbol": symbol,
+            "fo_segment": selection.fo_segment,
+            "expiry_rank": 1,
+            "minute_int": minute_int,
+            "minute_str": spot_event["minute_str"] or ce_event["minute_str"] or pe_event["minute_str"],
+            "spot_price": float(spot_event["close"]),
+            "spot_pubsub_token": config["pubsub_spot_token"],
+            "atm_strike": float(requested_atm_strike),
+            "strike": float(selection.strike),
+            "selected_from_atm": False,
+            "ce_instrument_key": selection.ce_instrument_key,
+            "pe_instrument_key": selection.pe_instrument_key,
+            "ce_exchange_token": selection.ce_exchange_token,
+            "pe_exchange_token": selection.pe_exchange_token,
+            "ce_pubsub_token": ce_pubsub_token,
+            "pe_pubsub_token": pe_pubsub_token,
+            "ce_carry_forward": ce_carry_forward,
+            "pe_carry_forward": pe_carry_forward,
+            "carry_forward": ce_carry_forward or pe_carry_forward,
+            "ce_open": float(ce_event["open"]),
+            "ce_high": float(ce_event["high"]),
+            "ce_low": float(ce_event["low"]),
+            "ce_close": float(ce_event["close"]),
+            "ce_volume": float(ce_event.get("volume") or 0),
+            "pe_open": float(pe_event["open"]),
+            "pe_high": float(pe_event["high"]),
+            "pe_low": float(pe_event["low"]),
+            "pe_close": float(pe_event["close"]),
+            "pe_volume": float(pe_event.get("volume") or 0),
+            "open": float(ce_event["open"]) + float(pe_event["open"]),
+            "high": float(ce_event["high"]) + float(pe_event["high"]),
+            "low": float(ce_event["low"]) + float(pe_event["low"]),
+            "close": float(ce_event["close"]) + float(pe_event["close"]),
+            "straddle_price": float(ce_event["close"]) + float(pe_event["close"]),
+            "volume": float(ce_event.get("volume") or 0) + float(pe_event.get("volume") or 0),
+            "source": source,
+            "updated_at_ms": _now_ms(),
+        }
+        return payload, identity
 
     def _fetch_latest_hash_events(self, tokens: set[str]) -> dict[str, dict[str, Any]]:
         if not tokens:
@@ -258,61 +390,10 @@ class SharedStraddleWorker:
         if previous_identity and minute_int <= previous_identity[0]:
             return
 
-        selected = self._select_exact_atm_strike(symbol, spot_event["close"], minute_int)
-        if not selected:
+        built = self._build_payload_for_symbol_minute(symbol, minute_int, source)
+        if not built:
             return
-        requested_atm_strike, selection, ce_event, pe_event = selected
-
-        ce_pubsub_token = f"{selection.fo_segment}:{selection.ce_exchange_token}"
-        pe_pubsub_token = f"{selection.fo_segment}:{selection.pe_exchange_token}"
-
-        identity = (
-            minute_int,
-            selection.strike,
-            selection.ce_exchange_token,
-            selection.pe_exchange_token,
-        )
-        ce_carry_forward = ce_event["minute_int"] != minute_int
-        pe_carry_forward = pe_event["minute_int"] != minute_int
-        payload = {
-            "symbol": symbol,
-            "fo_segment": selection.fo_segment,
-            "expiry_rank": 1,
-            "minute_int": minute_int,
-            "minute_str": spot_event["minute_str"] or ce_event["minute_str"] or pe_event["minute_str"],
-            "spot_price": float(spot_event["close"]),
-            "spot_pubsub_token": config["pubsub_spot_token"],
-            "atm_strike": float(requested_atm_strike),
-            "strike": float(selection.strike),
-            "selected_from_atm": False,
-            "ce_instrument_key": selection.ce_instrument_key,
-            "pe_instrument_key": selection.pe_instrument_key,
-            "ce_exchange_token": selection.ce_exchange_token,
-            "pe_exchange_token": selection.pe_exchange_token,
-            "ce_pubsub_token": ce_pubsub_token,
-            "pe_pubsub_token": pe_pubsub_token,
-            "ce_carry_forward": ce_carry_forward,
-            "pe_carry_forward": pe_carry_forward,
-            "carry_forward": ce_carry_forward or pe_carry_forward,
-            "ce_open": float(ce_event["open"]),
-            "ce_high": float(ce_event["high"]),
-            "ce_low": float(ce_event["low"]),
-            "ce_close": float(ce_event["close"]),
-            "ce_volume": float(ce_event.get("volume") or 0),
-            "pe_open": float(pe_event["open"]),
-            "pe_high": float(pe_event["high"]),
-            "pe_low": float(pe_event["low"]),
-            "pe_close": float(pe_event["close"]),
-            "pe_volume": float(pe_event.get("volume") or 0),
-            "open": float(ce_event["open"]) + float(pe_event["open"]),
-            "high": float(ce_event["high"]) + float(pe_event["high"]),
-            "low": float(ce_event["low"]) + float(pe_event["low"]),
-            "close": float(ce_event["close"]) + float(pe_event["close"]),
-            "straddle_price": float(ce_event["close"]) + float(pe_event["close"]),
-            "volume": float(ce_event.get("volume") or 0) + float(pe_event.get("volume") or 0),
-            "source": source,
-            "updated_at_ms": _now_ms(),
-        }
+        payload, identity = built
 
         version = self.redis.incr(version_key(symbol))
         payload["version"] = version
@@ -338,7 +419,7 @@ class SharedStraddleWorker:
 
         self.last_published[symbol] = identity
         print(
-            f"published symbol={symbol} minute={minute_int} strike={selection.strike} "
+            f"published symbol={symbol} minute={minute_int} strike={payload['strike']} "
             f"close={payload['close']} source={source}"
         )
 
@@ -446,6 +527,7 @@ DEFAULT_SOURCE_CHANNEL = REDIS_PUBSUB_CHANNEL
 DEFAULT_SYMBOLS = STRADDLE_SYMBOLS
 DEFAULT_POLL_INTERVAL_SECONDS = STRADDLE_POLL_INTERVAL_SECONDS
 DEFAULT_MAX_HISTORY = STRADDLE_MAX_HISTORY
+DEFAULT_STARTUP_BACKFILL_CANDLES = STRADDLE_STARTUP_BACKFILL_CANDLES
 RECENT_EVENT_CACHE_SIZE = 8
 
 
@@ -455,6 +537,7 @@ def main() -> None:
     parser.add_argument("--source-channel", default=DEFAULT_SOURCE_CHANNEL)
     parser.add_argument("--poll-interval-seconds", type=float, default=DEFAULT_POLL_INTERVAL_SECONDS)
     parser.add_argument("--max-history", type=int, default=DEFAULT_MAX_HISTORY)
+    parser.add_argument("--startup-backfill-candles", type=int, default=DEFAULT_STARTUP_BACKFILL_CANDLES)
     parser.add_argument("--symbols", default=DEFAULT_SYMBOLS)
     args = parser.parse_args()
 
@@ -465,6 +548,7 @@ def main() -> None:
         symbols=symbols,
         poll_interval_seconds=args.poll_interval_seconds,
         max_history=args.max_history,
+        startup_backfill_candles=args.startup_backfill_candles,
     ).run()
 
 

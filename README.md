@@ -84,8 +84,16 @@ Run one shared worker on the server:
 ```bash
 /home/vipul/PycharmProjects/.venv/bin/python /home/vipul/PycharmProjects/straddle_Data_Make/straddle_worker.py \
   --redis-url "$REDIS_URL" \
+  --startup-backfill-candles 0 \
   --symbols NIFTY,BANKNIFTY,FINNIFTY,MIDCPNIFTY,SENSEX,BANKEX
 ```
+
+Startup backfill:
+
+- On worker start, recent candles are rebuilt from Redis source hashes before live streaming.
+- Default is `0`, which means backfill **all available spot minutes** per symbol.
+- Set a positive number (for example `100`) to cap startup backfill size.
+- Configure with env `STRADDLE_STARTUP_BACKFILL_CANDLES` or CLI `--startup-backfill-candles`.
 
 What it does:
 

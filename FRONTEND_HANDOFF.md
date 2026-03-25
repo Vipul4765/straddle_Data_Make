@@ -1,96 +1,76 @@
 # Straddle Frontend Handoff
 
-## What exists today
-- **Live straddle stream** is produced by `straddle_Data_Make/straddle_worker.py` from Redis `candles:all` events.
-- **Historical straddle API** exists in backend at `GET /straddle/data` (`algoverve_backend_fresh/routes/straddle_routes.py`).
-- These are **two different data sources/contracts**:
-  - live: Redis keys/channels (worker output)
-  - historical: Postgres rows via backend API (`straddles` table)
+Use `straddle_Data_Make/api.py` as the frontend contract source.
 
-## Recommended frontend integration path
-- Use backend API (`/straddle/data`) for historical pages/backfill.
-- Use a backend-owned realtime bridge (WebSocket/SSE) for live updates from Redis.
-- Avoid browser-direct Redis access in production.
+## Base URL
+- Local: `http://127.0.0.1:8000`
+- Server example: `http://172.105.40.96:8001`
 
-## Redis live contract (from `straddle_worker.py`)
-Per symbol (`NIFTY`, `BANKNIFTY`, `FINNIFTY`, `MIDCPNIFTY`, `SENSEX`, `BANKEX`):
-- Current snapshot key: `straddle:current:{SYMBOL}`
-- Rolling history key: `straddle:history:{SYMBOL}` (Redis list, capped by `STRADDLE_MAX_HISTORY`, default 1000)
-- Update channel: `straddle:update:{SYMBOL}`
-- Version counter: `straddle:version:{SYMBOL}`
+## Supported symbols
+- `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `MIDCPNIFTY`, `SENSEX`, `BANKEX`
 
-Source OHLC hash read by worker:
-- `ohlc:1m:{token}` where fields are minute ints (`"093000"` style as int strings) and `__latest__`
+## API endpoints
+- `GET /health`
+- `GET /straddle/current/{symbol}`
+- `GET /straddle/history/{symbol}?limit=20`
+- `GET /straddle/stream/{symbol}` (SSE)
 
-### Live payload shape (single JSON object)
+## Canonical payload contract (current/history item/SSE update)
 ```json
 {
-  "symbol": "NIFTY",
-  "fo_segment": "NSE_FO",
-  "expiry_rank": 1,
-  "minute_int": 101500,
-  "minute_str": "10:15:00",
-  "spot_price": 22763.2,
-  "atm_strike": 22750.0,
-  "strike": 22750.0,
-  "ce_pubsub_token": "NSE_FO:12345",
-  "pe_pubsub_token": "NSE_FO:67890",
-  "ce_carry_forward": false,
-  "pe_carry_forward": true,
-  "carry_forward": true,
-  "ce_open": 101.2,
-  "ce_high": 110.0,
-  "ce_low": 99.8,
-  "ce_close": 105.6,
-  "pe_open": 120.4,
-  "pe_high": 125.0,
-  "pe_low": 118.7,
-  "pe_close": 121.1,
-  "open": 221.6,
-  "high": 235.0,
-  "low": 218.5,
-  "close": 226.7,
-  "volume": 0.0,
-  "source": "pubsub",
-  "updated_at_ms": 1760000000000,
-  "version": 42
+  "ce_close": 284.55,
+  "pe_close": 268.5,
+  "straddle_price": 553.05,
+  "time": "16:00:00",
+  "updated_at_ms": 1774435263573
 }
 ```
 
-Frontend notes:
-- `open/high/low/close` are **straddle OHLC = CE + PE** for selected strike.
-- `carry_forward=true` means at least one leg candle was missing for this minute and forward-filled.
-- `version` is monotonic per symbol and useful for dedupe/order checks.
+Field meaning:
+- `ce_close`: selected CE close for that straddle point.
+- `pe_close`: selected PE close for that straddle point.
+- `straddle_price`: `ce_close + pe_close`.
+- `time`: candle minute (`HH:MM:SS`), used for chart x-axis.
+- `updated_at_ms`: server publish timestamp in epoch milliseconds, used for ordering/dedupe.
 
-## Backend historical API contract (`GET /straddle/data`)
-Path: `algoverve_backend_fresh/routes/straddle_routes.py`
+## Frontend integration flow
+1. On page load, call history:
+   - `GET /straddle/history/{symbol}?limit=60`
+2. Then call current once to patch latest point:
+   - `GET /straddle/current/{symbol}`
+3. Keep chart live with SSE:
+   - `GET /straddle/stream/{symbol}`
 
-Required query params:
-- `symbol`
-- `filter` in:
-  - `latest_full_day` or `latest`
-  - `previous_latest`
-  - `range_latest`
-  - `range_day_plus_latest`
-  - `date_plus_latest`
+## SSE event format
+- Event name: `update`
+- Data: same canonical JSON payload above
+- Heartbeat comments: `: keepalive`
 
-Optional query params by filter:
-- `fromDate`, `toDate` for range filters
-- `day` (`ALL`, `MON`, `TUE`, `WED`, `THU`, `FRI`, `SAT`, `SUN`)
-- `date` for `date_plus_latest`
+## Browser example (EventSource)
+```js
+const symbol = "NIFTY";
+const base = "http://172.105.40.96:8001";
 
-Each row payload (from `schemas/straddle_schema.py`):
-- `trade_date`, `trade_time`, `open`, `high`, `low`, `close`, `atm`, `ce_price`, `pe_price`, `straddle_price`, `indiavix`
+const es = new EventSource(`${base}/straddle/stream/${symbol}`);
 
-## Readiness assessment
-- **Good**: core live computation pipeline is clear and production-usable for Redis consumers.
-- **Good**: historical API is documented with typed response schema.
-- **Gap**: no dedicated backend realtime endpoint for frontend; live stream is Redis-only today.
-- **Gap**: `straddle_routes.py` has `#TODO secure this straddle api`.
-- **Gap**: no tests in `straddle_Data_Make/` (manual validation only at present).
+es.addEventListener("update", (event) => {
+  const row = JSON.parse(event.data);
+  // row = { ce_close, pe_close, straddle_price, time, updated_at_ms }
+  console.log("live row", row);
+});
 
-## Minimum backend tasks before frontend starts realtime UI
-1. Add backend WebSocket/SSE endpoint that relays `straddle:update:{SYMBOL}`.
-2. Freeze a single frontend contract (field names/types for live + historical merge).
-3. Define reconnect/backfill policy (on reconnect: fetch `straddle:current` + last N history points).
+es.onerror = () => {
+  // Browser auto-reconnects EventSource by default.
+  console.log("SSE disconnected; waiting for reconnect...");
+};
+```
+
+## Error behavior
+- Invalid symbol returns `400` with allowed symbols.
+- Missing data for valid symbol can return `404` on current endpoint.
+
+## Notes for chart rendering
+- Prefer `updated_at_ms` for strict ordering when duplicate `time` points appear.
+- Use `time` as display label on x-axis.
+- If reconnect happens, refetch `history` with a small limit (for example 20) and merge by `updated_at_ms`.
 
