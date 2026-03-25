@@ -29,6 +29,14 @@ MAX_HISTORY_LIMIT = STRADDLE_API_MAX_HISTORY_LIMIT
 app = FastAPI(title="Straddle Live API", version="1.0.0")
 
 
+def _to_user_payload(payload: dict[str, Any]) -> dict[str, float | None]:
+    return {
+        "ce_close": payload.get("ce_close"),
+        "pe_close": payload.get("pe_close"),
+        "straddle_price": payload.get("straddle_price", payload.get("close")),
+    }
+
+
 def _normalize_symbol(symbol: str) -> str:
     normalized = symbol.strip().upper()
     if normalized not in SYMBOL_CONFIG:
@@ -63,7 +71,7 @@ def get_current(symbol: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"No current payload for {normalized}")
 
     try:
-        return json.loads(raw)
+        return _to_user_payload(json.loads(raw))
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=500, detail=f"Invalid JSON payload in Redis: {exc}") from exc
 
@@ -82,7 +90,7 @@ def get_history(symbol: str, limit: int = Query(default=20, ge=1, le=MAX_HISTORY
     parsed: list[dict[str, Any]] = []
     for row in rows:
         try:
-            parsed.append(json.loads(row))
+            parsed.append(_to_user_payload(json.loads(row)))
         except json.JSONDecodeError:
             continue
     return parsed
@@ -109,8 +117,12 @@ async def stream_updates(request: Request, symbol: str) -> StreamingResponse:
 
                 message = pubsub.get_message(timeout=0.0)
                 if message and message.get("type") == "message":
-                    payload = str(message.get("data") or "")
-                    yield f"event: update\ndata: {payload}\n\n"
+                    raw_payload = str(message.get("data") or "")
+                    try:
+                        event_payload = _to_user_payload(json.loads(raw_payload))
+                    except json.JSONDecodeError:
+                        continue
+                    yield f"event: update\ndata: {json.dumps(event_payload, ensure_ascii=True)}\n\n"
 
                 now = time.monotonic()
                 if now - last_heartbeat >= DEFAULT_STREAM_HEARTBEAT_SECONDS:

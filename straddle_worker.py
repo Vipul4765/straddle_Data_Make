@@ -308,6 +308,7 @@ class SharedStraddleWorker:
             "high": float(ce_event["high"]) + float(pe_event["high"]),
             "low": float(ce_event["low"]) + float(pe_event["low"]),
             "close": float(ce_event["close"]) + float(pe_event["close"]),
+            "straddle_price": float(ce_event["close"]) + float(pe_event["close"]),
             "volume": float(ce_event.get("volume") or 0) + float(pe_event.get("volume") or 0),
             "source": source,
             "updated_at_ms": _now_ms(),
