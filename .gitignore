@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Local secrets and env
+.env
+*.env
+
+# Logs and runtime outputs
+*.log
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+

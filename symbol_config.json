@@ -1,0 +1,50 @@
+{
+  "NIFTY": {
+    "fo_segment": "NSE_FO",
+    "spot_segment": "NSE_INDEX",
+    "spot_name": "Nifty 50",
+    "spot_trading_symbol": "NIFTY",
+    "pubsub_spot_token": "NSE_INDEX:Nifty_50",
+    "strike_step": 50
+  },
+  "BANKNIFTY": {
+    "fo_segment": "NSE_FO",
+    "spot_segment": "NSE_INDEX",
+    "spot_name": "Nifty Bank",
+    "spot_trading_symbol": "BANKNIFTY",
+    "pubsub_spot_token": "NSE_INDEX:Nifty_Bank",
+    "strike_step": 100
+  },
+  "FINNIFTY": {
+    "fo_segment": "NSE_FO",
+    "spot_segment": "NSE_INDEX",
+    "spot_name": "Nifty Fin Service",
+    "spot_trading_symbol": "FINNIFTY",
+    "pubsub_spot_token": "NSE_INDEX:Nifty_Fin_Service",
+    "strike_step": 50
+  },
+  "MIDCPNIFTY": {
+    "fo_segment": "NSE_FO",
+    "spot_segment": "NSE_INDEX",
+    "spot_name": "NIFTY MID SELECT",
+    "spot_trading_symbol": "MIDCPNIFTY",
+    "pubsub_spot_token": "NSE_INDEX:NIFTY_MID_SELECT",
+    "strike_step": 25
+  },
+  "SENSEX": {
+    "fo_segment": "BSE_FO",
+    "spot_segment": "BSE_INDEX",
+    "spot_name": "SENSEX",
+    "spot_trading_symbol": "SENSEX",
+    "pubsub_spot_token": "BSE_INDEX:SENSEX",
+    "strike_step": 100
+  },
+  "BANKEX": {
+    "fo_segment": "BSE_FO",
+    "spot_segment": "BSE_INDEX",
+    "spot_name": "BANKEX",
+    "spot_trading_symbol": "BANKEX",
+    "pubsub_spot_token": "BSE_INDEX:BANKEX",
+    "strike_step": 100
+  }
+}
