@@ -92,8 +92,11 @@ Startup backfill:
 
 - On worker start, recent candles are rebuilt from Redis source hashes before live streaming.
 - Default is `0`, which means backfill **all available spot minutes** per symbol.
+- Backfill is session-safe: only `09:15:00` to current session minute (max `15:30:00`) is rebuilt.
 - Set a positive number (for example `100`) to cap startup backfill size.
 - Configure with env `STRADDLE_STARTUP_BACKFILL_CANDLES` or CLI `--startup-backfill-candles`.
+- At/after `09:15 IST`, worker clears previous-day `straddle:current:*` and `straddle:history:*` once per day and waits for fresh spot pub/sub before republishing.
+- Live processing safety window is `09:15:00` to `15:30:30 IST`; candles published remain in market-minute range (`09:15:00` to `15:30:00`).
 
 What it does:
 
@@ -167,6 +170,7 @@ Response shape (current/history item/SSE update):
 
 ```json
 {
+  "strike": 22750.0,
   "ce_close": 284.55,
   "pe_close": 268.5,
   "straddle_price": 553.05,
@@ -194,3 +198,4 @@ http://<SERVER_IP>:8000/docs
 
 - `SSE_SCALING.md` - required architecture and deployment improvements for SSE at scale.
 - `SSE_SERVER_TUNING_CHECKLIST.md` - quick production checklist (app, Nginx, OS limits, validation).
+

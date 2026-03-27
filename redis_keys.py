@@ -17,5 +17,9 @@ def history_key(symbol: str) -> str:
     return f"straddle:history:{symbol.upper()}"
 
 
+def daily_reset_marker_key(symbol: str) -> str:
+    return f"straddle:last_reset_date:{symbol.upper()}"
+
+
 def source_hash_key(pubsub_spot_token: str) -> str:
     return f"ohlc:1m:{pubsub_spot_token}"

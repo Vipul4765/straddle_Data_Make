@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import re
 import time
@@ -10,7 +11,14 @@ import redis
 
 try:
     from .contract_data import SYMBOL_CONFIG, contract_file
-    from .redis_keys import current_key, history_key, source_hash_key, update_channel, version_key
+    from .redis_keys import (
+        current_key,
+        daily_reset_marker_key,
+        history_key,
+        source_hash_key,
+        update_channel,
+        version_key,
+    )
     from .settings import (
         REDIS_PUBSUB_CHANNEL,
         REDIS_URL,
@@ -22,7 +30,14 @@ try:
     from .straddle_builder import atm_strike, build_straddle_for_strike
 except ImportError:  # Support direct script execution
     from contract_data import SYMBOL_CONFIG, contract_file
-    from redis_keys import current_key, history_key, source_hash_key, update_channel, version_key
+    from redis_keys import (
+        current_key,
+        daily_reset_marker_key,
+        history_key,
+        source_hash_key,
+        update_channel,
+        version_key,
+    )
     from settings import (
         REDIS_PUBSUB_CHANNEL,
         REDIS_URL,
@@ -118,6 +133,35 @@ def _mask_secret_url(raw_url: str) -> str:
     return re.sub(r"(://[^:/?#]*:)[^@/]+@", r"\1***@", raw_url)
 
 
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+MARKET_OPEN_MINUTE_INT = 91500
+MARKET_CLOSE_MINUTE_INT = 153000
+MARKET_CLOSE_GRACE_TIME = dt.time(hour=15, minute=30, second=30)
+
+
+def _ist_now() -> dt.datetime:
+    return dt.datetime.now(tz=IST)
+
+
+def _reset_due_now(now_ist: dt.datetime) -> bool:
+    return (now_ist.hour, now_ist.minute) >= (9, 15)
+
+
+def _minute_within_market_session(minute_int: int) -> bool:
+    return MARKET_OPEN_MINUTE_INT <= minute_int <= MARKET_CLOSE_MINUTE_INT
+
+
+def _within_processing_grace(now_ist: dt.datetime) -> bool:
+    return dt.time(hour=9, minute=15, second=0) <= now_ist.time() <= MARKET_CLOSE_GRACE_TIME
+
+
+def _current_session_max_minute(now_ist: dt.datetime) -> int:
+    minute_int = now_ist.hour * 10000 + now_ist.minute * 100
+    if minute_int < MARKET_OPEN_MINUTE_INT:
+        return MARKET_OPEN_MINUTE_INT
+    return min(minute_int, MARKET_CLOSE_MINUTE_INT)
+
+
 class SharedStraddleWorker:
     def __init__(
         self,
@@ -141,6 +185,7 @@ class SharedStraddleWorker:
         self.last_published: dict[str, tuple[int, float, str, str]] = {}
         self.tracked_tokens = self._build_tracked_tokens()
         self.spot_tokens = {SYMBOL_CONFIG[symbol]["pubsub_spot_token"] for symbol in self.symbols}
+        self.wait_for_spot_after_reset: set[str] = set()
 
     def _build_tracked_tokens(self) -> set[str]:
         tracked: set[str] = set()
@@ -157,6 +202,7 @@ class SharedStraddleWorker:
         print(f"redis={_mask_secret_url(self.redis_url)}")
         print(f"source_channel={self.source_channel}")
         print(f"symbols={','.join(sorted(self.symbols))}")
+        self._run_daily_reset_if_due()
         self._clear_legacy_current_payloads()
         self._bootstrap_from_hashes()
 
@@ -172,10 +218,34 @@ class SharedStraddleWorker:
 
                 now = time.monotonic()
                 if now >= next_poll_at:
-                    self._refresh_from_hashes()
+                    self._run_daily_reset_if_due()
+                    if _within_processing_grace(_ist_now()):
+                        self._refresh_from_hashes()
                     next_poll_at = now + self.poll_interval_seconds
         finally:
             pubsub.close()
+
+    def _run_daily_reset_if_due(self) -> None:
+        now_ist = _ist_now()
+        if not _reset_due_now(now_ist):
+            return
+
+        today = now_ist.date().isoformat()
+        for symbol in sorted(self.symbols):
+            marker_key = daily_reset_marker_key(symbol)
+            already_reset_for_today = self.redis.get(marker_key) == today
+            if already_reset_for_today:
+                continue
+
+            pipe = self.redis.pipeline(transaction=False)
+            pipe.delete(current_key(symbol))
+            pipe.delete(history_key(symbol))
+            pipe.set(marker_key, today)
+            pipe.execute()
+
+            self.last_published.pop(symbol, None)
+            self.wait_for_spot_after_reset.add(symbol)
+            print(f"daily_reset symbol={symbol} date={today} at_or_after=09:15IST")
 
     def _bootstrap_from_hashes(self) -> None:
         bootstrap_events = self._fetch_latest_hash_events(self.tracked_tokens)
@@ -241,9 +311,16 @@ class SharedStraddleWorker:
         if not minute_values:
             return []
         unique_sorted_minutes = sorted(set(minute_values))
+        session_minutes = [
+            minute
+            for minute in unique_sorted_minutes
+            if _minute_within_market_session(minute) and minute <= _current_session_max_minute(_ist_now())
+        ]
+        if not session_minutes:
+            return []
         if limit <= 0:
-            return unique_sorted_minutes
-        return unique_sorted_minutes[-limit:]
+            return session_minutes
+        return session_minutes[-limit:]
 
     def _build_payload_for_symbol_minute(
         self,
@@ -362,7 +439,9 @@ class SharedStraddleWorker:
 
         symbol = _symbol_from_pubsub_token(token)
         if symbol and symbol in self.symbols:
-            self._maybe_publish_for_symbol(symbol, source="pubsub")
+            # After the daily reset, require one fresh spot tick before republishing.
+            self.wait_for_spot_after_reset.discard(symbol)
+            self._maybe_publish_for_symbol(symbol, source="pubsub_spot")
             return
 
         for candidate_symbol in self.symbols:
@@ -380,12 +459,18 @@ class SharedStraddleWorker:
             self._maybe_publish_for_symbol(symbol, source="redis_hash")
 
     def _maybe_publish_for_symbol(self, symbol: str, source: str) -> None:
+        if symbol in self.wait_for_spot_after_reset and source != "pubsub_spot":
+            return
+
         config = SYMBOL_CONFIG[symbol]
         spot_event = self.latest_event_by_token.get(config["pubsub_spot_token"])
         if not spot_event:
             return
 
         minute_int = int(spot_event["minute_int"])
+        if not _minute_within_market_session(minute_int):
+            return
+
         previous_identity = self.last_published.get(symbol)
         if previous_identity and minute_int <= previous_identity[0]:
             return
