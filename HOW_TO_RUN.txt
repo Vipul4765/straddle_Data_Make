@@ -1,0 +1,31 @@
+straddle_Data_Make - How To Run
+===============================
+
+This utility builds nearest-expiry straddle candles from the live Redis channel `candles:all`.
+
+Prereqs:
+- Redis must contain the source spot/FO candles and must be publishing `candles:all`
+- Fill `straddle_Data_Make/.env` with the correct `REDIS_URL` (password, tunnel, etc)
+
+Run the worker (recommended):
+  cd /home/vipul/PycharmProjects/straddle_Data_Make
+  set -a
+  source .env
+  set +a
+  /home/vipul/PycharmProjects/.venv/bin/python straddle_worker.py \
+    --redis-url "$REDIS_URL" \
+    --startup-backfill-candles 0 \
+    --symbols "$STRADDLE_SYMBOLS"
+
+Read current snapshot:
+  /home/vipul/PycharmProjects/.venv/bin/python straddle_client.py --redis-url "$REDIS_URL" current --symbol NIFTY
+
+Watch live updates:
+  /home/vipul/PycharmProjects/.venv/bin/python straddle_client.py --redis-url "$REDIS_URL" watch --symbol NIFTY
+
+Optional: HTTP API (FastAPI + SSE, port 8000)
+  /home/vipul/PycharmProjects/.venv/bin/pip install -r /home/vipul/PycharmProjects/straddle_Data_Make/requirements.txt
+  /home/vipul/PycharmProjects/.venv/bin/uvicorn api:app --host 0.0.0.0 --port 8000
+
+More details live in:
+- /home/vipul/PycharmProjects/straddle_Data_Make/README.md
