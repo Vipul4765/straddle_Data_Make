@@ -4,7 +4,7 @@ Use `straddle_Data_Make/api.py` as the frontend contract source.
 
 ## Base URL
 - Local: `http://127.0.0.1:8000`
-- Server example: `http://172.105.40.96:8001`
+- Deployed: `http://172.105.40.96:8082` (docs: `/docs`)
 
 ## Supported symbols
 - `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `MIDCPNIFTY`, `SENSEX`, `BANKEX`
@@ -12,52 +12,59 @@ Use `straddle_Data_Make/api.py` as the frontend contract source.
 ## API endpoints
 - `GET /health`
 - `GET /straddle/current/{symbol}`
-- `GET /straddle/history/{symbol}?limit=20`
-- `GET /straddle/stream/{symbol}` (SSE)
+- `GET /straddle/history/{symbol}?limit=20` (limit capped by `STRADDLE_API_MAX_HISTORY_LIMIT`)
+- `GET /straddle/stream/{symbol}` (SSE, keepalive comments)
 
-## Canonical payload contract (current/history item/SSE update)
+## Canonical payload contract (current/history/SSE update)
+Minimal front-end fields (all responses include these):
 ```json
 {
+  "symbol": "NIFTY",
+  "minute_int": 101500,
+  "minute_str": "10:15:00",
   "strike": 22750.0,
   "ce_close": 284.55,
   "pe_close": 268.5,
   "straddle_price": 553.05,
-  "time": "16:00:00",
-  "updated_at_ms": 1774435263573
+  "volume": 12345,
+  "updated_at_ms": 1774435263573,
+  "version": 42
 }
 ```
 
+Additional fields (present, safe to ignore): `spot_price`, `atm_strike`, `ce_*`/`pe_*` OHLC, `carry_forward` flags, instrument tokens. 
+
 Field meaning:
-- `ce_close`: selected CE close for that straddle point.
-- `pe_close`: selected PE close for that straddle point.
-- `strike`: selected CE/PE strike price for that candle minute.
-- `straddle_price`: `ce_close + pe_close`.
-- `time`: candle minute (`HH:MM:SS`), used for chart x-axis.
-- `updated_at_ms`: server publish timestamp in epoch milliseconds, used for ordering/dedupe.
+- `minute_int` / `minute_str`: candle minute (`HH:MM:SS`) for x-axis grouping.
+- `strike`: CE/PE strike chosen for the ATM straddle.
+- `straddle_price`: `ce_close + pe_close` (same as `close`).
+- `updated_at_ms`: publish timestamp; combine with `minute_int` + `version` for dedupe/ordering.
 
 ## Frontend integration flow
-1. On page load, call history:
+1. On page load, fetch history (small window keeps payload light):
    - `GET /straddle/history/{symbol}?limit=60`
-2. Then call current once to patch latest point:
+2. Patch latest point:
    - `GET /straddle/current/{symbol}`
-3. Keep chart live with SSE:
+3. Keep chart live with SSE (auto-reconnect via EventSource):
    - `GET /straddle/stream/{symbol}`
+4. On SSE reconnect, re-pull a small history window (for example `limit=30`) and merge by `(minute_int, version)`.
 
 ## SSE event format
 - Event name: `update`
-- Data: same canonical JSON payload above
-- Heartbeat comments: `: keepalive`
+- Data: canonical JSON payload above
+- Heartbeat comments: `: keepalive` (no data)
+- Dedupe: use tuple `(minute_int, version)`; older `version` for the same `minute_int` is stale.
 
 ## Browser example (EventSource)
 ```js
 const symbol = "NIFTY";
-const base = "http://172.105.40.96:8001";
+const base = "http://172.105.40.96:8082";
 
 const es = new EventSource(`${base}/straddle/stream/${symbol}`);
 
 es.addEventListener("update", (event) => {
   const row = JSON.parse(event.data);
-  // row = { strike, ce_close, pe_close, straddle_price, time, updated_at_ms }
+  // row has: symbol, minute_int/str, strike, ce_close, pe_close, straddle_price, updated_at_ms, version
   console.log("live row", row);
 });
 
@@ -65,6 +72,37 @@ es.onerror = () => {
   // Browser auto-reconnects EventSource by default.
   console.log("SSE disconnected; waiting for reconnect...");
 };
+```
+
+## Multi-symbol SSE (frontend)
+Streaming is one EventSource per symbol; open multiple and merge client-side:
+
+```js
+const base = "http://172.105.40.96:8082";
+const symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"];
+
+const streams = new Map();
+const seen = new Map(); // symbol -> Set of `${minute_int}:${version}`
+
+symbols.forEach((symbol) => {
+  const es = new EventSource(`${base}/straddle/stream/${symbol}`);
+  streams.set(symbol, es);
+  seen.set(symbol, new Set());
+
+  es.addEventListener("update", (event) => {
+    const row = JSON.parse(event.data);
+    const key = `${row.minute_int}:${row.version}`;
+    const bucket = seen.get(symbol);
+    if (bucket.has(key)) return;
+    bucket.add(key);
+    console.log("live", symbol, row);
+    // TODO: merge into chart/table as needed
+  });
+
+  es.onerror = () => {
+    console.log(`SSE disconnected for ${symbol}; waiting for reconnect...`);
+  };
+});
 ```
 
 ## Error behavior

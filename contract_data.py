@@ -27,6 +27,14 @@ except ImportError:  # Support direct script execution
 
 CONTRACT_URL = STRADDLE_CONTRACT_URL
 OUTPUT_FILE = Path(STRADDLE_CONTRACT_OUTPUT_FILE)
+EXTRA_INDEX_ROWS = (
+    {
+        "segment": "NSE_INDEX",
+        "storage_name": "INDIA VIX",
+        "display_names": {"INDIA VIX", "India VIX"},
+        "trading_symbols": {"INDIA_VIX", "India_VIX", "INDIA VIX"},
+    },
+)
 
 
 def _expiry_datetime(row: dict[str, Any]) -> dt.datetime:
@@ -88,6 +96,7 @@ def load_contracts(data: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str
         elif seg in {"NSE_INDEX", "BSE_INDEX"}:
             trading_symbol = row.get("trading_symbol")
             display_name = row.get("name")
+            matched = False
             for config in SYMBOL_CONFIG.values():
                 if seg != config["spot_segment"]:
                     continue
@@ -95,6 +104,21 @@ def load_contracts(data: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str
                     continue
 
                 segment_wise_contract_dict[seg][config["spot_name"]] = row
+                if exchange_token:
+                    token_contract_dict[str(exchange_token)] = row
+                matched = True
+                break
+
+            if matched:
+                continue
+
+            for extra in EXTRA_INDEX_ROWS:
+                if seg != extra["segment"]:
+                    continue
+                if display_name not in extra["display_names"] and trading_symbol not in extra["trading_symbols"]:
+                    continue
+
+                segment_wise_contract_dict[seg][extra["storage_name"]] = row
                 if exchange_token:
                     token_contract_dict[str(exchange_token)] = row
                 break
@@ -134,6 +158,10 @@ def build_pub_sub_tokens(segment_wise_contract_dict: dict[str, Any]) -> list[str
             strike_tree = inst_tree.get(option_type, {}).get(1, {})
             for strike in sorted(strike_tree):
                 add_token(strike_tree[strike].get("instrument_key"))
+
+    india_vix_row = segment_wise_contract_dict["NSE_INDEX"].get("INDIA VIX")
+    if isinstance(india_vix_row, dict):
+        add_token(india_vix_row.get("instrument_key"))
 
     return tokens
 

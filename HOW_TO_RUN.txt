@@ -6,26 +6,111 @@ This utility builds nearest-expiry straddle candles from the live Redis channel 
 Prereqs:
 - Redis must contain the source spot/FO candles and must be publishing `candles:all`
 - Fill `straddle_Data_Make/.env` with the correct `REDIS_URL` (password, tunnel, etc)
+- Install deps once per venv:
+  /home/vipul/PycharmProjects/.venv/bin/pip install -r /home/vipul/PycharmProjects/straddle_Data_Make/requirements.txt
 
-Run the worker (recommended):
+Supported symbols (from `symbol_config.json`):
+- BANKEX,BANKNIFTY,FINNIFTY,MIDCPNIFTY,NIFTY,SENSEX
+
+To run ALL symbols, set this in `straddle_Data_Make/.env`:
+  STRADDLE_SYMBOLS=BANKEX,BANKNIFTY,FINNIFTY,MIDCPNIFTY,NIFTY,SENSEX
+
+Run the worker on laptop (foreground):
   cd /home/vipul/PycharmProjects/straddle_Data_Make
   set -a
   source .env
   set +a
-  /home/vipul/PycharmProjects/.venv/bin/python straddle_worker.py \
-    --redis-url "$REDIS_URL" \
-    --startup-backfill-candles 0 \
-    --symbols "$STRADDLE_SYMBOLS"
+  /home/vipul/PycharmProjects/.venv/bin/python straddle_worker.py --symbols "$STRADDLE_SYMBOLS"
+
+Run the worker in background with nohup:
+  cd /home/vipul/PycharmProjects/straddle_Data_Make
+  set -a
+  source .env
+  set +a
+  nohup /home/vipul/PycharmProjects/.venv/bin/python straddle_worker.py \
+    --symbols "$STRADDLE_SYMBOLS" \
+    > /home/vipul/PycharmProjects/logs/straddle_worker.out 2>&1 &
+  echo $!
+
+Check nohup logs:
+  tail -f /home/vipul/PycharmProjects/logs/straddle_worker.out
 
 Read current snapshot:
-  /home/vipul/PycharmProjects/.venv/bin/python straddle_client.py --redis-url "$REDIS_URL" current --symbol NIFTY
+  /home/vipul/PycharmProjects/.venv/bin/python straddle_client.py current --symbol NIFTY
+
+Read current snapshot for all symbols:
+  for s in NIFTY BANKNIFTY FINNIFTY MIDCPNIFTY SENSEX BANKEX; do
+    echo "===== $s ====="
+    /home/vipul/PycharmProjects/.venv/bin/python straddle_client.py current --symbol "$s"
+  done
 
 Watch live updates:
-  /home/vipul/PycharmProjects/.venv/bin/python straddle_client.py --redis-url "$REDIS_URL" watch --symbol NIFTY
+  /home/vipul/PycharmProjects/.venv/bin/python straddle_client.py watch --symbol NIFTY
 
 Optional: HTTP API (FastAPI + SSE, port 8000)
-  /home/vipul/PycharmProjects/.venv/bin/pip install -r /home/vipul/PycharmProjects/straddle_Data_Make/requirements.txt
   /home/vipul/PycharmProjects/.venv/bin/uvicorn api:app --host 0.0.0.0 --port 8000
+
+SSE smoke test (after API is running and worker is publishing):
+  curl -v -N http://127.0.0.1:8000/straddle/stream/NIFTY | head
+  # Expect HTTP/1.1 200, header `Content-Type: text/event-stream`, initial `: keepalive`,
+  # and `event: update` lines as new straddle ticks arrive.
+
+Export API data to CSV with Python:
+  /home/vipul/PycharmProjects/.venv/bin/python /home/vipul/PycharmProjects/straddle_Data_Make/export_api_to_csv.py \
+    --url http://172.105.40.96:8082/docs \
+    --mode current \
+    --symbols NIFTY,BANKNIFTY,FINNIFTY,MIDCPNIFTY,SENSEX,BANKEX \
+    --output /home/vipul/PycharmProjects/straddle_current.csv
+
+Export history to CSV:
+  /home/vipul/PycharmProjects/.venv/bin/python /home/vipul/PycharmProjects/straddle_Data_Make/export_api_to_csv.py \
+    --url http://172.105.40.96:8082/docs \
+    --mode history \
+    --symbols NIFTY \
+    --limit 100 \
+    --output /home/vipul/PycharmProjects/nifty_history.csv
+
+Stream live updates into CSV:
+  /home/vipul/PycharmProjects/.venv/bin/python /home/vipul/PycharmProjects/straddle_Data_Make/export_api_to_csv.py \
+    --url http://172.105.40.96:8082/docs \
+    --mode stream \
+    --symbols NIFTY \
+    --output /home/vipul/PycharmProjects/nifty_live.csv
+
+Get recent history first and then keep receiving live data in the same CSV:
+  /home/vipul/PycharmProjects/.venv/bin/python /home/vipul/PycharmProjects/straddle_Data_Make/export_api_to_csv.py \
+    --url http://172.105.40.96:8082/docs \
+    --mode history-stream \
+    --symbols NIFTY \
+    --limit 100 \
+    --output /home/vipul/PycharmProjects/nifty_history_live.csv
+
+Run live CSV receiver in background with nohup:
+  nohup /home/vipul/PycharmProjects/.venv/bin/python /home/vipul/PycharmProjects/straddle_Data_Make/export_api_to_csv.py \
+    --url http://172.105.40.96:8082/docs \
+    --mode history-stream \
+    --symbols NIFTY \
+    --limit 100 \
+    --output /home/vipul/PycharmProjects/nifty_history_live.csv \
+    > /home/vipul/PycharmProjects/logs/nifty_history_live.out 2>&1 &
+  echo $!
+
+Check deployed API:
+  curl -sS http://172.105.40.96:8082/health
+  curl -sS http://172.105.40.96:8082/straddle/current/NIFTY
+  curl -sS "http://172.105.40.96:8082/straddle/history/NIFTY?limit=5"
+  curl -N http://172.105.40.96:8082/straddle/stream/NIFTY
+
+Check all deployed API symbols:
+  for s in NIFTY BANKNIFTY FINNIFTY MIDCPNIFTY SENSEX BANKEX; do
+    echo "===== $s ====="
+    curl -sS "http://172.105.40.96:8082/straddle/current/$s"
+    echo
+  done
+
+Note:
+- If `BANKEX` returns `404 {"detail":{"error":"missing_current","symbol":"BANKEX"}}`, that means the worker has not published current BANKEX data yet.
+- `REDIS_PASSWORD` is not read separately by the worker. The password must be inside `REDIS_URL` in `.env`.
 
 More details live in:
 - /home/vipul/PycharmProjects/straddle_Data_Make/README.md
