@@ -15,6 +15,7 @@ import requests
 
 DEFAULT_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"]
 DEFAULT_URL = "http://172.105.40.96:8082/docs"
+RAW_INDEX_SYMBOLS = {"INDIA_VIX"}
 PREFERRED_COLUMNS = [
     "symbol",
     "minute_str",
@@ -77,8 +78,12 @@ def make_row_key(row: dict) -> tuple:
     )
 
 
+def endpoint_prefix(symbol: str) -> str:
+    return "index" if symbol.upper() in RAW_INDEX_SYMBOLS else "straddle"
+
+
 def fetch_history(base_url: str, symbol: str, limit: int, timeout: int) -> list[dict]:
-    url = f"{base_url}/straddle/history/{symbol}?limit={limit}"
+    url = f"{base_url}/{endpoint_prefix(symbol)}/history/{symbol}?limit={limit}"
     try:
         response = requests.get(url, timeout=timeout)
         response.raise_for_status()
@@ -114,7 +119,7 @@ def write_rows(output_file: Path, rows: list[dict], append: bool, dedupe: set[tu
 
 
 def _stream_worker(base_url: str, symbol: str, timeout: int, queue: Queue, stop_event: threading.Event) -> None:
-    url = f"{base_url}/straddle/stream/{symbol}"
+    url = f"{base_url}/{endpoint_prefix(symbol)}/stream/{symbol}"
     try:
         with requests.get(url, stream=True, timeout=timeout) as response:
             response.raise_for_status()
@@ -251,7 +256,8 @@ def main() -> None:
 
                 writer.writerow(row)
                 fh.flush()
-                print(f"[{symbol}] {row.get('minute_str')} {row.get('straddle_price')}")
+                value = row.get("straddle_price", row.get("close"))
+                print(f"[{symbol}] {row.get('minute_str')} {value}")
     except KeyboardInterrupt:
         print("Stopping streams...")
     finally:
