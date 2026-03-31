@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager
 from functools import partial
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Dict, Set
 
 import redis
+import redis.asyncio
 from fastapi import FastAPI, HTTPException, Query
 from starlette.responses import JSONResponse, StreamingResponse
 
@@ -40,8 +42,101 @@ RAW_INDEX_SYMBOLS = {
 }
 ALLOWED_INDEX_SYMBOLS = sorted(RAW_INDEX_SYMBOLS.keys())
 
-app = FastAPI(title="straddle_Data_Make API", version="1.0.0")
+class PubSubManager:
+    def __init__(self, redis_url: str):
+        self.redis_url = redis_url
+        self._redis_client: redis.asyncio.Redis | None = None
+        self._pubsub = None
+        
+        # Channel name -> set of asyncio.Queue
+        self.listeners: Dict[str, Set[asyncio.Queue]] = {}
+        self._listen_task: asyncio.Task | None = None
 
+    async def get_redis(self):
+        if self._redis_client is None:
+            self._redis_client = redis.asyncio.from_url(self.redis_url, decode_responses=True)
+        return self._redis_client
+
+    async def start(self):
+        if self._listen_task is not None:
+            return
+        r = await self.get_redis()
+        self._pubsub = r.pubsub(ignore_subscribe_messages=True)
+        self._listen_task = asyncio.create_task(self._listen_loop())
+
+    async def stop(self):
+        if self._listen_task:
+            self._listen_task.cancel()
+            self._listen_task = None
+        if self._pubsub:
+            await self._pubsub.close()
+            self._pubsub = None
+        if self._redis_client:
+            await self._redis_client.aclose()
+            self._redis_client = None
+
+    async def _listen_loop(self):
+        # Keeps reading from a single shared redis connection
+        try:
+            while True:
+                if not self._pubsub.subscribed:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                msg = await self._pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if msg and msg.get("type") == "message":
+                    channel = msg.get("channel", "")
+                    data = msg.get("data", "")
+                    if isinstance(data, (bytes, bytearray)):
+                        data = data.decode("utf-8", errors="replace")
+                        
+                    if channel in self.listeners:
+                        queues = list(self.listeners[channel])
+                        for q in queues:
+                            try:
+                                q.put_nowait(data)
+                            except asyncio.QueueFull:
+                                # Drop slow clients to prevent memory leaks
+                                pass
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"PubSubManager listen loop error: {e}")
+
+    async def subscribe(self, channel: str) -> asyncio.Queue:
+        if self._pubsub is None:
+            await self.start()
+
+        if channel not in self.listeners:
+            self.listeners[channel] = set()
+            await self._pubsub.subscribe(channel)
+
+        # Buffer up to 100 messages for slow clients
+        q = asyncio.Queue(maxsize=100)
+        self.listeners[channel].add(q)
+        return q
+
+    async def unsubscribe(self, channel: str, q: asyncio.Queue):
+        if channel in self.listeners and q in self.listeners[channel]:
+            self.listeners[channel].remove(q)
+            if not self.listeners[channel]:
+                del self.listeners[channel]
+                if self._pubsub:
+                    await self._pubsub.unsubscribe(channel)
+
+
+broadcaster = PubSubManager(REDIS_URL)
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    # Startup
+    await broadcaster.start()
+    yield
+    # Shutdown
+    await broadcaster.stop()
+    _SYNC_REDIS_POOL.disconnect()
+
+app = FastAPI(title="straddle_Data_Make API", version="1.0.0", lifespan=lifespan)
 
 def _validate_symbol(symbol: str) -> str:
     normalized = symbol.strip().upper()
@@ -57,8 +152,11 @@ def _validate_symbol(symbol: str) -> str:
     return normalized
 
 
+# --- Sync Connection Pool for GET Requests ---
+_SYNC_REDIS_POOL = redis.ConnectionPool.from_url(REDIS_URL, decode_responses=True)
+
 def _redis_client() -> redis.Redis:
-    return redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    return redis.Redis(connection_pool=_SYNC_REDIS_POOL)
 
 
 def _validate_index_symbol(symbol: str) -> str:
@@ -202,47 +300,38 @@ def get_straddle_history(
 @app.get("/straddle/stream/{symbol}")
 async def stream_straddle(symbol: str) -> StreamingResponse:
     symbol = _validate_symbol(symbol)
+    channel = update_channel(symbol)
 
     async def event_stream() -> AsyncIterator[str]:
-        # Optimize: using aioredis directly inside stream avoids thread blocking
-        client = redis.asyncio.from_url(REDIS_URL, decode_responses=True)
-        pubsub = client.pubsub(ignore_subscribe_messages=True)
-        await pubsub.subscribe(update_channel(symbol))
+        q = await broadcaster.subscribe(channel)
 
         last_heartbeat = time.monotonic()
         heartbeat_every = float(STRADDLE_STREAM_HEARTBEAT_SECONDS)
 
         try:
-            # Send an initial comment so reverse proxies flush headers.
             yield ": keepalive\n\n"
 
             while True:
+                time_to_wait = max(0.0, heartbeat_every - (time.monotonic() - last_heartbeat))
+                
                 try:
-                    msg = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=1.0)
-                except asyncio.TimeoutError:
-                    msg = None
-
-                if msg and msg.get("type") == "message":
-                    data = msg.get("data", "")
-                    if isinstance(data, (bytes, bytearray)):
-                        data = data.decode("utf-8", errors="replace")
-                    # Worker publishes JSON strings. Emit as SSE "update" events.
+                    data = await asyncio.wait_for(q.get(), timeout=min(1.0, time_to_wait))
                     yield f"event: update\ndata: {data}\n\n"
                     last_heartbeat = time.monotonic()
-
-                now = time.monotonic()
-                if now - last_heartbeat >= heartbeat_every:
-                    yield ": keepalive\n\n"
-                    last_heartbeat = now
-        except asyncio.CancelledError:
+                except asyncio.TimeoutError:
+                    now = time.monotonic()
+                    if now - last_heartbeat >= heartbeat_every:
+                        yield ": keepalive\n\n"
+                        last_heartbeat = now
+        except (asyncio.CancelledError, Exception) as e:
              pass # normal when client disconnects
-        except Exception as e:
-            yield f"event: error\ndata: {str(e)}\n\n"
         finally:
+            # Shield removal to prevent cancelled task from killing the unsubscribe hook
             try:
-                await pubsub.close()
-            finally:
-                await client.aclose()
+                await asyncio.shield(broadcaster.unsubscribe(channel, q))
+            except Exception:
+                pass
+
 
     return StreamingResponse(
         event_stream(),
@@ -310,11 +399,10 @@ def get_index_history(
 async def stream_index(symbol: str) -> StreamingResponse:
     symbol = _validate_index_symbol(symbol)
     token = RAW_INDEX_SYMBOLS[symbol]["pubsub_token"]
+    channel = REDIS_PUBSUB_CHANNEL
 
     async def event_stream() -> AsyncIterator[str]:
-        client = redis.asyncio.from_url(REDIS_URL, decode_responses=True)
-        pubsub = client.pubsub(ignore_subscribe_messages=True)
-        await pubsub.subscribe(REDIS_PUBSUB_CHANNEL)
+        q = await broadcaster.subscribe(channel)
 
         last_heartbeat = time.monotonic()
         heartbeat_every = float(STRADDLE_STREAM_HEARTBEAT_SECONDS)
@@ -323,40 +411,22 @@ async def stream_index(symbol: str) -> StreamingResponse:
             yield ": keepalive\n\n"
 
             while True:
-                try:
-                    msg = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=1.0)
-                except asyncio.TimeoutError:
-                    msg = None
+                time_to_wait = max(0.0, heartbeat_every - (time.monotonic() - last_heartbeat))
 
-                if msg and msg.get("type") == "message":
-                    data = msg.get("data", "")
-                    if isinstance(data, (bytes, bytearray)):
-                        data = data.decode("utf-8", errors="replace")
-                    parsed = _normalize_index_pubsub_event(data, symbol, token)
+                try:
+                    raw_data = await asyncio.wait_for(q.get(), timeout=min(1.0, time_to_wait))
+                    parsed = _normalize_index_pubsub_event(raw_data, symbol, token)
                     if parsed:
                         yield f"event: update\ndata: {json.dumps(parsed, ensure_ascii=True)}\n\n"
                         last_heartbeat = time.monotonic()
-
-                now = time.monotonic()
-                if now - last_heartbeat >= heartbeat_every:
-                    yield ": keepalive\n\n"
-                    last_heartbeat = now
-        except asyncio.CancelledError:
+                except asyncio.TimeoutError:
+                    now = time.monotonic()
+                    if now - last_heartbeat >= heartbeat_every:
+                        yield ": keepalive\n\n"
+                        last_heartbeat = now
+        except (asyncio.CancelledError, Exception) as e:
              pass # normal when user disconnects
-        except Exception as e:
-            yield f"event: error\ndata: {str(e)}\n\n"
         finally:
             try:
-                await pubsub.close()
-            finally:
-                await client.aclose()
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+                await asyncio.shield(broadcaster.unsubscribe(channel, q))
+           

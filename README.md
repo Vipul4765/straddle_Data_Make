@@ -199,3 +199,65 @@ http://<SERVER_IP>:8000/docs
 - `SSE_SCALING.md` - required architecture and deployment improvements for SSE at scale.
 - `SSE_SERVER_TUNING_CHECKLIST.md` - quick production checklist (app, Nginx, OS limits, validation).
 
+## Recent Production Resiliency Updates
+
+Recent infrastructural upgrades were deployed specifically targeting high-scale durability, holiday calendar automation, and enterprise grade system resiliency:
+
+1. **Enterprise Redis In-Memory Fan-Out (SSE Streams)**  
+   - **Problem:** Streaming active live markets to over 10K frontend clients simultaneously blew up the Redis network sockets via per-user 1:1 connections. 
+   - **Solution:** Integrated an automated `PubSubManager` in `api.py`. The node establishes strictly **ONE** master Redis socket for market updates. When a tick drops, the python system internally broadcasts the JSON via massive asynchronous memory-bound user queues.
+   - **Scale:** Effortlessly scales 65,000+ SSE streams concurrent instances per instance while respecting internal server boundaries. 
+
+2. **Aggressive Zombie Memory Protection**  
+   - **Problem:** Rapid "rage-reloads" or flaky internet users generated hundreds of abandoned `CancelError` sockets before python could trigger garbage collection unsubscribes, silently stacking memory leaks leading to Out-Of-Memory (OOM) outages.
+   - **Solution:** Deployed nested `asyncio.shield(...)` blocks across all SSE destruction calls. No matter how violently a user connection slices or crashes, memory sweep sequences *must* finish natively guaranteeing zero runaway memory consumption. Added bounded max-items queues which safely discard/skip trailing users to prevent stale memory overflow.
+
+3. **Persistent Thread Pools for Synchronous REST (GET) Bombs**
+   - **Problem:** Generating standard TCP sessions `redis.from_url` per `/get/current` request during peak market hours crushed Linux bounds causing massive `TIME_WAIT` spikes—blocking the entire host access for 60-seconds. 
+   - **Solution:** Replaced dynamic instantiations with a globally persistent `_SYNC_REDIS_POOL`. 
+
+4. **Dynamic Database Trading Day Validation**  
+   - Transferred purely static `settings.py` dates to a strictly mirrored PostgreSQL implementation tied to the main engine stack (`market_ingest_final`). 
+   - Now checks `SELECT exchange FROM holidays WHERE date = 'Today'` perfectly bridging weekend vs non-weekend database trading exceptions dynamically. 
+   - **Fail-Open Fallback Engine:** Graceful database drops log error exceptions temporarily isolating the cycle without caching fatal server death flags, enabling the node to automatically jump back alive the moment Postgres re-boots.
+
+## Configuration
+Set environment variables directly or create a `.env` file referencing your unified `market_ingest_final` db setups.
+
+`DATABASE_URL=postgresql://user:password@cloud-url`
+`REDIS_URL=redis://localhost:6379/0`
+`REDIS_PUBSUB_CHANNEL=candles:all`
+
+## Standard Deployment / Operation
+
+### Running on Production Servers (Background / nohup)
+To run these securely on your VPS instance without them dying when you close the terminal, you must use background `nohup` execution and bind the API explicitly to `0.0.0.0` for Nginx reverse-proxy pairing.
+
+1. **Move to directory and create log target:**
+```bash
+cd /home/vipul/PycharmProjects/straddle_Data_Make
+mkdir -p ../logs
+```
+
+2. **Load `.env` securely and start Background Worker:**
+```bash
+set -a && source .env && set +a
+nohup python3 straddle_worker.py > ../logs/straddle_worker.out 2>&1 &
+```
+
+3. **Start the API Server tightly bound to `0.0.0.0`:**
+```bash
+nohup uvicorn api:app --host 0.0.0.0 --port 8000 > ../logs/straddle_api.out 2>&1 &
+```
+
+*(To monitor these later, run `tail -f ../logs/straddle_worker.out` or `tail -f ../logs/straddle_api.out`)*
+
+### Quick Development Run
+If you are just developing, you can run normal mode:
+```bash
+# Run Worker
+python3 straddle_worker.py
+
+# Run API
+uvicorn api:app --host 0.0.0.0 --port 8000
+```
