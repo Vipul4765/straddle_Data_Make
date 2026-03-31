@@ -26,8 +26,16 @@ try:
         STRADDLE_POLL_INTERVAL_SECONDS,
         STRADDLE_STARTUP_BACKFILL_CANDLES,
         STRADDLE_SYMBOLS,
+        TRADING_CANDLE_END,
+        TRADING_CANDLE_START,
+        TRADING_HOLIDAYS,
+        TRADING_RESET_TIME,
+        TRADING_SESSION_END,
+        TRADING_SESSION_START,
+        DATABASE_URL,
+        MARKET_HOLIDAY_EXCHANGES,
     )
-    from .straddle_builder import atm_strike, build_straddle_for_strike
+    from trading_calendar import TradingCalendar, parse_holidays, parse_time
 except ImportError:  # Support direct script execution
     from contract_data import SYMBOL_CONFIG, contract_file
     from redis_keys import (
@@ -45,8 +53,16 @@ except ImportError:  # Support direct script execution
         STRADDLE_POLL_INTERVAL_SECONDS,
         STRADDLE_STARTUP_BACKFILL_CANDLES,
         STRADDLE_SYMBOLS,
+        TRADING_CANDLE_END,
+        TRADING_CANDLE_START,
+        TRADING_HOLIDAYS,
+        TRADING_RESET_TIME,
+        TRADING_SESSION_END,
+        TRADING_SESSION_START,
+        DATABASE_URL,
+        MARKET_HOLIDAY_EXCHANGES,
     )
-    from straddle_builder import atm_strike, build_straddle_for_strike
+    from trading_calendar import TradingCalendar, parse_holidays, parse_time
 
 
 def _now_ms() -> int:
@@ -133,33 +149,37 @@ def _mask_secret_url(raw_url: str) -> str:
     return re.sub(r"(://[^:/?#]*:)[^@/]+@", r"\1***@", raw_url)
 
 
-IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
-MARKET_OPEN_MINUTE_INT = 91500
-MARKET_CLOSE_MINUTE_INT = 153000
-MARKET_CLOSE_GRACE_TIME = dt.time(hour=15, minute=30, second=30)
+CALENDAR = TradingCalendar(
+    session_start=parse_time(TRADING_SESSION_START, field_name="TRADING_SESSION_START"),
+    session_end=parse_time(TRADING_SESSION_END, field_name="TRADING_SESSION_END"),
+    reset_time=parse_time(TRADING_RESET_TIME, field_name="TRADING_RESET_TIME"),
+    candle_start=parse_time(TRADING_CANDLE_START, field_name="TRADING_CANDLE_START"),
+    candle_end=parse_time(TRADING_CANDLE_END, field_name="TRADING_CANDLE_END"),
+    holidays=parse_holidays(TRADING_HOLIDAYS),
+    database_url=DATABASE_URL,
+    holiday_exchanges=MARKET_HOLIDAY_EXCHANGES,
+)
+CANDLE_START_MINUTE_INT, CANDLE_END_MINUTE_INT = CALENDAR.candle_minute_bounds()
 
 
 def _ist_now() -> dt.datetime:
-    return dt.datetime.now(tz=IST)
+    return CALENDAR.now()
 
 
 def _reset_due_now(now_ist: dt.datetime) -> bool:
-    return (now_ist.hour, now_ist.minute) >= (9, 15)
+    return CALENDAR.reset_is_due(now_ist)
 
 
 def _minute_within_market_session(minute_int: int) -> bool:
-    return MARKET_OPEN_MINUTE_INT <= minute_int <= MARKET_CLOSE_MINUTE_INT
+    return CANDLE_START_MINUTE_INT <= minute_int <= CANDLE_END_MINUTE_INT
 
 
 def _within_processing_grace(now_ist: dt.datetime) -> bool:
-    return dt.time(hour=9, minute=15, second=0) <= now_ist.time() <= MARKET_CLOSE_GRACE_TIME
+    return CALENDAR.session_is_open(now_ist)
 
 
 def _current_session_max_minute(now_ist: dt.datetime) -> int:
-    minute_int = now_ist.hour * 10000 + now_ist.minute * 100
-    if minute_int < MARKET_OPEN_MINUTE_INT:
-        return MARKET_OPEN_MINUTE_INT
-    return min(minute_int, MARKET_CLOSE_MINUTE_INT)
+    return CALENDAR.current_session_max_minute(now_ist)
 
 
 class SharedStraddleWorker:
@@ -186,6 +206,7 @@ class SharedStraddleWorker:
         self.tracked_tokens = self._build_tracked_tokens()
         self.spot_tokens = {SYMBOL_CONFIG[symbol]["pubsub_spot_token"] for symbol in self.symbols}
         self.wait_for_spot_after_reset: set[str] = set()
+        self.contracts_loaded_for_date: str | None = None
 
     def _build_tracked_tokens(self) -> set[str]:
         tracked: set[str] = set()
@@ -202,9 +223,10 @@ class SharedStraddleWorker:
         print(f"redis={_mask_secret_url(self.redis_url)}")
         print(f"source_channel={self.source_channel}")
         print(f"symbols={','.join(sorted(self.symbols))}")
-        self._run_daily_reset_if_due()
         self._clear_legacy_current_payloads()
-        self._bootstrap_from_hashes()
+        self._run_daily_reset_if_due()
+        if _within_processing_grace(_ist_now()):
+            self._bootstrap_from_hashes()
 
         pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
         pubsub.subscribe(self.source_channel)
@@ -212,6 +234,12 @@ class SharedStraddleWorker:
 
         try:
             while True:
+                now_ist = _ist_now()
+                if not _within_processing_grace(now_ist):
+                    self._run_daily_reset_if_due()
+                    time.sleep(min(max(self.poll_interval_seconds, 1.0), CALENDAR.seconds_until_next_session(now_ist) or 1.0))
+                    continue
+
                 message = pubsub.get_message(timeout=1.0)
                 if message and message["type"] == "message":
                     self._handle_pubsub_message(message["data"])
@@ -231,6 +259,7 @@ class SharedStraddleWorker:
             return
 
         today = now_ist.date().isoformat()
+        self._refresh_contracts_for_trading_day(today)
         for symbol in sorted(self.symbols):
             marker_key = daily_reset_marker_key(symbol)
             already_reset_for_today = self.redis.get(marker_key) == today
@@ -245,7 +274,19 @@ class SharedStraddleWorker:
 
             self.last_published.pop(symbol, None)
             self.wait_for_spot_after_reset.add(symbol)
-            print(f"daily_reset symbol={symbol} date={today} at_or_after=09:15IST")
+            print(f"daily_reset symbol={symbol} date={today} at_or_after={TRADING_RESET_TIME}IST")
+
+    def _refresh_contracts_for_trading_day(self, trading_day: str) -> None:
+        if self.contracts_loaded_for_date == trading_day:
+            return
+
+        self.segment_wise_contract_dict, _ = contract_file()
+        self.tracked_tokens = self._build_tracked_tokens()
+        self.spot_tokens = {SYMBOL_CONFIG[symbol]["pubsub_spot_token"] for symbol in self.symbols}
+        self.latest_event_by_token.clear()
+        self.recent_events_by_token.clear()
+        self.contracts_loaded_for_date = trading_day
+        print(f"contracts_refreshed date={trading_day}")
 
     def _bootstrap_from_hashes(self) -> None:
         bootstrap_events = self._fetch_latest_hash_events(self.tracked_tokens)
@@ -431,6 +472,8 @@ class SharedStraddleWorker:
                 self.redis.delete(current_key(symbol))
 
     def _handle_pubsub_message(self, raw: str) -> None:
+        if not _within_processing_grace(_ist_now()):
+            return
         event = _normalize_event(raw)
         token = event["token"]
         if token not in self.tracked_tokens:

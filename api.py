@@ -204,9 +204,10 @@ async def stream_straddle(symbol: str) -> StreamingResponse:
     symbol = _validate_symbol(symbol)
 
     async def event_stream() -> AsyncIterator[str]:
-        client = _redis_client()
+        # Optimize: using aioredis directly inside stream avoids thread blocking
+        client = redis.asyncio.from_url(REDIS_URL, decode_responses=True)
         pubsub = client.pubsub(ignore_subscribe_messages=True)
-        pubsub.subscribe(update_channel(symbol))
+        await pubsub.subscribe(update_channel(symbol))
 
         last_heartbeat = time.monotonic()
         heartbeat_every = float(STRADDLE_STREAM_HEARTBEAT_SECONDS)
@@ -216,9 +217,10 @@ async def stream_straddle(symbol: str) -> StreamingResponse:
             yield ": keepalive\n\n"
 
             while True:
-                msg = await asyncio.to_thread(
-                    partial(pubsub.get_message, ignore_subscribe_messages=True, timeout=1.0)
-                )
+                try:
+                    msg = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=1.0)
+                except asyncio.TimeoutError:
+                    msg = None
 
                 if msg and msg.get("type") == "message":
                     data = msg.get("data", "")
@@ -232,11 +234,15 @@ async def stream_straddle(symbol: str) -> StreamingResponse:
                 if now - last_heartbeat >= heartbeat_every:
                     yield ": keepalive\n\n"
                     last_heartbeat = now
+        except asyncio.CancelledError:
+             pass # normal when client disconnects
+        except Exception as e:
+            yield f"event: error\ndata: {str(e)}\n\n"
         finally:
             try:
-                pubsub.close()
+                await pubsub.close()
             finally:
-                client.close()
+                await client.aclose()
 
     return StreamingResponse(
         event_stream(),
@@ -306,9 +312,9 @@ async def stream_index(symbol: str) -> StreamingResponse:
     token = RAW_INDEX_SYMBOLS[symbol]["pubsub_token"]
 
     async def event_stream() -> AsyncIterator[str]:
-        client = _redis_client()
+        client = redis.asyncio.from_url(REDIS_URL, decode_responses=True)
         pubsub = client.pubsub(ignore_subscribe_messages=True)
-        pubsub.subscribe(REDIS_PUBSUB_CHANNEL)
+        await pubsub.subscribe(REDIS_PUBSUB_CHANNEL)
 
         last_heartbeat = time.monotonic()
         heartbeat_every = float(STRADDLE_STREAM_HEARTBEAT_SECONDS)
@@ -317,9 +323,10 @@ async def stream_index(symbol: str) -> StreamingResponse:
             yield ": keepalive\n\n"
 
             while True:
-                msg = await asyncio.to_thread(
-                    partial(pubsub.get_message, ignore_subscribe_messages=True, timeout=1.0)
-                )
+                try:
+                    msg = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=1.0)
+                except asyncio.TimeoutError:
+                    msg = None
 
                 if msg and msg.get("type") == "message":
                     data = msg.get("data", "")
@@ -334,11 +341,15 @@ async def stream_index(symbol: str) -> StreamingResponse:
                 if now - last_heartbeat >= heartbeat_every:
                     yield ": keepalive\n\n"
                     last_heartbeat = now
+        except asyncio.CancelledError:
+             pass # normal when user disconnects
+        except Exception as e:
+            yield f"event: error\ndata: {str(e)}\n\n"
         finally:
             try:
-                pubsub.close()
+                await pubsub.close()
             finally:
-                client.close()
+                await client.aclose()
 
     return StreamingResponse(
         event_stream(),

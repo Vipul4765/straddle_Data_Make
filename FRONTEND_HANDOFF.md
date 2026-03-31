@@ -1,117 +1,376 @@
-# Straddle Frontend Handoff
+# Frontend Handoff
 
-Use `straddle_Data_Make/api.py` as the frontend contract source.
+Use [api.py](/home/vipul/PycharmProjects/straddle_Data_Make/api.py) as the frontend contract source.
+
+This service now exposes 2 data families:
+
+1. Straddle candles
+2. Raw index OHLC candles
+
+Do not treat them as the same payload type.
 
 ## Base URL
-- Local: `http://127.0.0.1:8000`
-- Deployed: `http://172.105.40.96:8082` (docs: `/docs`)
 
-## Supported symbols
-- `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `MIDCPNIFTY`, `SENSEX`, `BANKEX`
+- Local: `http://127.0.0.1:8082`
+- Server: `http://172.105.40.96:8082`
+- Docs: `http://172.105.40.96:8082/docs`
 
-## API endpoints
-- `GET /health`
+## Supported Symbols
+
+### Straddle symbols
+
+- `NIFTY`
+- `BANKNIFTY`
+- `FINNIFTY`
+- `MIDCPNIFTY`
+- `SENSEX`
+- `BANKEX`
+
+These come from:
+
 - `GET /straddle/current/{symbol}`
-- `GET /straddle/history/{symbol}?limit=20` (limit capped by `STRADDLE_API_MAX_HISTORY_LIMIT`)
-- `GET /straddle/stream/{symbol}` (SSE, keepalive comments)
+- `GET /straddle/history/{symbol}?limit=...`
+- `GET /straddle/stream/{symbol}`
 
-## Canonical payload contract (current/history/SSE update)
-Minimal front-end fields (all responses include these):
+### Raw index symbols
+
+- `INDIA_VIX`
+
+This comes from:
+
+- `GET /index/current/{symbol}`
+- `GET /index/history/{symbol}?limit=...`
+- `GET /index/stream/{symbol}`
+
+## Important Difference
+
+### Straddle payload
+
+This is a synthetic candle built from:
+
+- ATM CE
+- ATM PE
+- same minute
+
+It includes straddle-specific fields like:
+
+- `strike`
+- `straddle_price`
+- `ce_close`
+- `pe_close`
+- `spot_price`
+- `version`
+
+### INDIA_VIX payload
+
+This is raw index OHLC data from Redis key:
+
+- `ohlc:1m:NSE_INDEX:India_VIX`
+
+It does not have:
+
+- `strike`
+- `straddle_price`
+- `ce_close`
+- `pe_close`
+- `version`
+
+It only has raw candle fields like:
+
+- `open`
+- `high`
+- `low`
+- `close`
+- `volume`
+- `token`
+
+So if the frontend shows blank `strike` or `straddle_price` for `INDIA_VIX`, that is correct behavior.
+
+## Endpoints
+
+### Shared health
+
+- `GET /health`
+
+### Straddle endpoints
+
+- `GET /straddle/current/{symbol}`
+- `GET /straddle/history/{symbol}?limit=20`
+- `GET /straddle/stream/{symbol}`
+
+### Raw index endpoints
+
+- `GET /index/current/{symbol}`
+- `GET /index/history/{symbol}?limit=20`
+- `GET /index/stream/{symbol}`
+
+## Payload Contracts
+
+### Straddle current/history/SSE update
+
+Example:
+
 ```json
 {
   "symbol": "NIFTY",
   "minute_int": 101500,
   "minute_str": "10:15:00",
-  "strike": 22750.0,
-  "ce_close": 284.55,
-  "pe_close": 268.5,
-  "straddle_price": 553.05,
-  "volume": 12345,
+  "spot_price": 22801.25,
+  "atm_strike": 22800.0,
+  "strike": 22800.0,
+  "open": 210.2,
+  "high": 212.4,
+  "low": 208.9,
+  "close": 209.9,
+  "straddle_price": 209.9,
+  "ce_close": 102.4,
+  "pe_close": 107.5,
+  "volume": 120.0,
   "updated_at_ms": 1774435263573,
-  "version": 42
+  "version": 42,
+  "source": "pubsub"
 }
 ```
 
-Additional fields (present, safe to ignore): `spot_price`, `atm_strike`, `ce_*`/`pe_*` OHLC, `carry_forward` flags, instrument tokens. 
+Important fields:
 
-Field meaning:
-- `minute_int` / `minute_str`: candle minute (`HH:MM:SS`) for x-axis grouping.
-- `strike`: CE/PE strike chosen for the ATM straddle.
-- `straddle_price`: `ce_close + pe_close` (same as `close`).
-- `updated_at_ms`: publish timestamp; combine with `minute_int` + `version` for dedupe/ordering.
+- `symbol`: chart symbol
+- `minute_int`: candle minute, used for grouping
+- `minute_str`: display time
+- `strike`: selected strike used for the straddle candle
+- `straddle_price`: same as `close`
+- `spot_price`: underlying spot/index close for that minute
+- `version`: update counter, useful for dedupe
+- `updated_at_ms`: publish timestamp
 
-## Frontend integration flow
-1. On page load, fetch history (small window keeps payload light):
+Additional fields may exist and are safe to ignore:
+
+- `carry_forward`
+- `ce_*`
+- `pe_*`
+- `ce_instrument_key`
+- `pe_instrument_key`
+- `ce_pubsub_token`
+- `pe_pubsub_token`
+
+### INDIA_VIX current/history/SSE update
+
+Example:
+
+```json
+{
+  "symbol": "INDIA_VIX",
+  "token": "NSE_INDEX:India_VIX",
+  "minute_int": 105700,
+  "minute_str": "10:57:00",
+  "open": 28.39,
+  "high": 28.40,
+  "low": 28.39,
+  "close": 28.40,
+  "volume": 0.0,
+  "source": "redis_hash"
+}
+```
+
+Important fields:
+
+- `symbol`: always `INDIA_VIX`
+- `token`: source token
+- `minute_int`: candle minute
+- `minute_str`: display time
+- `open`, `high`, `low`, `close`, `volume`: raw OHLC
+- `source`: `redis_hash` or `pubsub`
+
+Fields not present for `INDIA_VIX`:
+
+- `strike`
+- `straddle_price`
+- `ce_close`
+- `pe_close`
+- `version`
+- `updated_at_ms`
+
+## Frontend Integration Flow
+
+### For straddle symbols
+
+1. Fetch history:
    - `GET /straddle/history/{symbol}?limit=60`
-2. Patch latest point:
+2. Fetch current:
    - `GET /straddle/current/{symbol}`
-3. Keep chart live with SSE (auto-reconnect via EventSource):
+3. Open SSE:
    - `GET /straddle/stream/{symbol}`
-4. On SSE reconnect, re-pull a small history window (for example `limit=30`) and merge by `(minute_int, version)`.
+4. Merge by:
+   - `minute_int`
+   - and prefer higher `version`
 
-## SSE event format
-- Event name: `update`
-- Data: canonical JSON payload above
-- Heartbeat comments: `: keepalive` (no data)
-- Dedupe: use tuple `(minute_int, version)`; older `version` for the same `minute_int` is stale.
+### For INDIA_VIX
 
-## Browser example (EventSource)
+1. Fetch history:
+   - `GET /index/history/INDIA_VIX?limit=60`
+2. Fetch current:
+   - `GET /index/current/INDIA_VIX`
+3. Open SSE:
+   - `GET /index/stream/INDIA_VIX`
+4. Merge by:
+   - `minute_int`
+
+For `INDIA_VIX`, there is no `version`, so use `minute_int` as the candle identity.
+
+## Frontend Rules
+
+### Straddle chart
+
+Use:
+
+- x-axis: `minute_int` or `minute_str`
+- y-axis: `straddle_price` or `close`
+
+### INDIA_VIX chart
+
+Use:
+
+- x-axis: `minute_int` or `minute_str`
+- y-axis: `close`
+
+Do not try to read:
+
+- `strike`
+- `straddle_price`
+- `ce_close`
+- `pe_close`
+
+from `INDIA_VIX`.
+
+## SSE Format
+
+Both stream endpoints use SSE:
+
+- event name: `update`
+- heartbeat: `: keepalive`
+
+### Straddle SSE
+
+- endpoint: `/straddle/stream/{symbol}`
+- data: full straddle JSON payload
+
+### Index SSE
+
+- endpoint: `/index/stream/{symbol}`
+- data: raw index OHLC JSON payload
+
+## Browser Examples
+
+### Straddle EventSource
+
 ```js
-const symbol = "NIFTY";
 const base = "http://172.105.40.96:8082";
+const symbol = "NIFTY";
 
 const es = new EventSource(`${base}/straddle/stream/${symbol}`);
 
 es.addEventListener("update", (event) => {
   const row = JSON.parse(event.data);
-  // row has: symbol, minute_int/str, strike, ce_close, pe_close, straddle_price, updated_at_ms, version
-  console.log("live row", row);
+  console.log("straddle row", row);
 });
-
-es.onerror = () => {
-  // Browser auto-reconnects EventSource by default.
-  console.log("SSE disconnected; waiting for reconnect...");
-};
 ```
 
-## Multi-symbol SSE (frontend)
-Streaming is one EventSource per symbol; open multiple and merge client-side:
+### INDIA_VIX EventSource
 
 ```js
 const base = "http://172.105.40.96:8082";
-const symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"];
+const symbol = "INDIA_VIX";
 
-const streams = new Map();
-const seen = new Map(); // symbol -> Set of `${minute_int}:${version}`
+const es = new EventSource(`${base}/index/stream/${symbol}`);
 
-symbols.forEach((symbol) => {
-  const es = new EventSource(`${base}/straddle/stream/${symbol}`);
-  streams.set(symbol, es);
-  seen.set(symbol, new Set());
-
-  es.addEventListener("update", (event) => {
-    const row = JSON.parse(event.data);
-    const key = `${row.minute_int}:${row.version}`;
-    const bucket = seen.get(symbol);
-    if (bucket.has(key)) return;
-    bucket.add(key);
-    console.log("live", symbol, row);
-    // TODO: merge into chart/table as needed
-  });
-
-  es.onerror = () => {
-    console.log(`SSE disconnected for ${symbol}; waiting for reconnect...`);
-  };
+es.addEventListener("update", (event) => {
+  const row = JSON.parse(event.data);
+  console.log("india vix row", row);
 });
 ```
 
-## Error behavior
-- Invalid symbol returns `400` with allowed symbols.
-- Missing data for valid symbol can return `404` on current endpoint.
+## Recommended Frontend Normalizer
 
-## Notes for chart rendering
-- Prefer `updated_at_ms` for strict ordering when duplicate `time` points appear.
-- Use `time` as display label on x-axis.
-- If reconnect happens, refetch `history` with a small limit (for example 20) and merge by `updated_at_ms`.
-- Backend session guard: published candle times are limited to market minutes (`09:15:00` to `15:30:00` IST) with processing grace until `15:30:30`.
+Use one normalizer in the frontend so chart code stays simple.
 
+Example:
+
+```js
+function normalizeRow(symbol, row) {
+  if (symbol === "INDIA_VIX") {
+    return {
+      symbol: row.symbol,
+      minute_int: row.minute_int,
+      minute_str: row.minute_str,
+      value: row.close,
+      open: row.open,
+      high: row.high,
+      low: row.low,
+      close: row.close,
+      volume: row.volume,
+      type: "index",
+    };
+  }
+
+  return {
+    symbol: row.symbol,
+    minute_int: row.minute_int,
+    minute_str: row.minute_str,
+    value: row.straddle_price ?? row.close,
+    open: row.open,
+    high: row.high,
+    low: row.low,
+    close: row.close,
+    volume: row.volume,
+    strike: row.strike,
+    spot_price: row.spot_price,
+    version: row.version,
+    type: "straddle",
+  };
+}
+```
+
+## Multi-Symbol Streaming
+
+Open one EventSource per symbol.
+
+Recommended mapping:
+
+- `NIFTY` -> `/straddle/stream/NIFTY`
+- `BANKNIFTY` -> `/straddle/stream/BANKNIFTY`
+- `FINNIFTY` -> `/straddle/stream/FINNIFTY`
+- `MIDCPNIFTY` -> `/straddle/stream/MIDCPNIFTY`
+- `SENSEX` -> `/straddle/stream/SENSEX`
+- `BANKEX` -> `/straddle/stream/BANKEX`
+- `INDIA_VIX` -> `/index/stream/INDIA_VIX`
+
+## Error Behavior
+
+- invalid straddle symbol -> `400`
+- invalid index symbol -> `400`
+- missing current data -> `404`
+- SSE stays open and sends keepalive comments even if no fresh update arrives immediately
+
+## CSV Tool Note
+
+[straddle_live_csv.py](/home/vipul/PycharmProjects/straddle_Data_Make/straddle_live_csv.py) now supports `INDIA_VIX`.
+
+It routes automatically:
+
+- straddle symbols -> `/straddle/...`
+- `INDIA_VIX` -> `/index/...`
+
+That means this works:
+
+```bash
+/home/vipul/PycharmProjects/.venv/bin/python /home/vipul/PycharmProjects/straddle_Data_Make/straddle_live_csv.py --url 'http://172.105.40.96:8082/docs' --symbols INDIA_VIX --history-limit 100 --output india_vix_live.csv
+```
+
+## Final Instruction For Frontend Developer
+
+Use:
+
+- `/straddle/...` for `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `MIDCPNIFTY`, `SENSEX`, `BANKEX`
+- `/index/...` for `INDIA_VIX`
+
+Do not try to render `INDIA_VIX` as a straddle.
