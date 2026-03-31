@@ -332,7 +332,6 @@ async def stream_straddle(symbol: str) -> StreamingResponse:
             except Exception:
                 pass
 
-
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
@@ -429,4 +428,15 @@ async def stream_index(symbol: str) -> StreamingResponse:
         finally:
             try:
                 await asyncio.shield(broadcaster.unsubscribe(channel, q))
-           
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

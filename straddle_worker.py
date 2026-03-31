@@ -35,6 +35,7 @@ try:
         DATABASE_URL,
         MARKET_HOLIDAY_EXCHANGES,
     )
+    from .straddle_builder import atm_strike, build_straddle_for_strike
     from trading_calendar import TradingCalendar, parse_holidays, parse_time
 except ImportError:  # Support direct script execution
     from contract_data import SYMBOL_CONFIG, contract_file
@@ -62,6 +63,7 @@ except ImportError:  # Support direct script execution
         DATABASE_URL,
         MARKET_HOLIDAY_EXCHANGES,
     )
+    from straddle_builder import atm_strike, build_straddle_for_strike
     from trading_calendar import TradingCalendar, parse_holidays, parse_time
 
 
