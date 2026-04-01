@@ -49,6 +49,21 @@ REDIS_PASSWORD=<paste-current-redis-password-here>
 REDIS_URL=redis://:${REDIS_PASSWORD}@127.0.0.1:6380/0
 ```
 
+Use the same auth database that the backend is already using for holiday checks:
+
+```dotenv
+DATABASE_URL=postgresql://algoverve_auth_user:<password>@127.0.0.1:5433/algoverve_auth_db
+MARKET_HOLIDAY_EXCHANGES=NSE,BSE
+```
+
+Required PostgreSQL permission for the worker:
+
+```sql
+GRANT SELECT ON TABLE public.holidays TO algoverve_auth_user;
+```
+
+Without that grant, the worker logs a holidays lookup failure and will not trust the trading-day check.
+
 All scripts in this folder auto-load `.env` from `straddle_Data_Make/`.
 
 Symbol mappings are loaded from `symbol_config.json` (or the file pointed to by `STRADDLE_SYMBOL_CONFIG_FILE`).
@@ -108,6 +123,11 @@ What it does:
 - stores history for chart use
 - publishes updates on `straddle:update:<SYMBOL>`
 
+Important:
+
+- `straddle_worker.py` must be running against the same Redis as the API.
+- `api.py` only reads `straddle:current:*`, `straddle:history:*`, and `straddle:update:*`; it does not generate them.
+
 Redis keys:
 
 - `straddle:current:NIFTY`
@@ -165,6 +185,15 @@ Endpoints:
 - `GET /straddle/current/{symbol}`
 - `GET /straddle/history/{symbol}?limit=20`
 - `GET /straddle/stream/{symbol}` (SSE)
+- `GET /index/current/{symbol}`
+- `GET /index/history/{symbol}?limit=20`
+- `GET /index/stream/{symbol}` (SSE)
+
+Route map:
+
+- Use `/straddle/...` for `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `MIDCPNIFTY`, `SENSEX`, `BANKEX`
+- Use `/index/...` for raw index symbols only; right now that means `INDIA_VIX`
+- `NIFTY` and `BANKNIFTY` are not valid on `/index/...`
 
 Response shape (current/history item/SSE update):
 
@@ -186,6 +215,8 @@ curl -sS http://127.0.0.1:8000/health
 curl -sS http://127.0.0.1:8000/straddle/current/NIFTY
 curl -sS "http://127.0.0.1:8000/straddle/history/NIFTY?limit=5"
 curl -N http://127.0.0.1:8000/straddle/stream/NIFTY
+curl -sS http://127.0.0.1:8000/index/current/INDIA_VIX
+curl -sS "http://127.0.0.1:8000/index/history/INDIA_VIX?limit=5"
 ```
 
 Swagger docs:
@@ -219,14 +250,54 @@ Recent infrastructural upgrades were deployed specifically targeting high-scale 
 4. **Dynamic Database Trading Day Validation**  
    - Transferred purely static `settings.py` dates to a strictly mirrored PostgreSQL implementation tied to the main engine stack (`market_ingest_final`). 
    - Now checks `SELECT exchange FROM holidays WHERE date = 'Today'` perfectly bridging weekend vs non-weekend database trading exceptions dynamically. 
-   - **Fail-Open Fallback Engine:** Graceful database drops log error exceptions temporarily isolating the cycle without caching fatal server death flags, enabling the node to automatically jump back alive the moment Postgres re-boots.
+   - **Fail-Open Fallback Engine:** If the holiday lookup fails, the worker logs the DB error, temporarily treats the day as trading, and retries on the next loop instead of freezing the whole publisher.
 
 ## Configuration
 Set environment variables directly or create a `.env` file referencing your unified `market_ingest_final` db setups.
 
-`DATABASE_URL=postgresql://user:password@cloud-url`
-`REDIS_URL=redis://localhost:6379/0`
+`DATABASE_URL=postgresql://algoverve_auth_user:<password>@127.0.0.1:5433/algoverve_auth_db`
+`REDIS_URL=redis://:${REDIS_PASSWORD}@127.0.0.1:6380/0`
 `REDIS_PUBSUB_CHANNEL=candles:all`
+
+## Troubleshooting
+
+If `NIFTY` or `BANKNIFTY` are missing:
+
+- Check the worker first. The API cannot return current/history/SSE data until `straddle_worker.py` writes Redis keys.
+- Check the correct route. `NIFTY` and `BANKNIFTY` belong to `/straddle/...`, not `/index/...`.
+- Check the tunnel Redis directly:
+
+```bash
+redis-cli -a "$REDIS_PASSWORD" -h 127.0.0.1 -p 6380 PING
+redis-cli -a "$REDIS_PASSWORD" -h 127.0.0.1 -p 6380 GET straddle:current:NIFTY
+redis-cli -a "$REDIS_PASSWORD" -h 127.0.0.1 -p 6380 LLEN straddle:history:NIFTY
+```
+
+- Check PostgreSQL access and holiday-table permission:
+
+```bash
+psql "$DATABASE_URL" -c '\conninfo'
+psql "$DATABASE_URL" -c "select count(*) from public.holidays;"
+```
+
+- If the worker logs `permission denied for relation holidays`, fix it with:
+
+```sql
+GRANT SELECT ON TABLE public.holidays TO algoverve_auth_user;
+```
+
+- A healthy worker startup should print lines similar to:
+  `contracts_refreshed ...`
+  `startup_backfill symbol=NIFTY ...`
+  `published symbol=NIFTY ...`
+
+- Quick SSE verification:
+
+```bash
+curl -N http://127.0.0.1:8000/straddle/stream/NIFTY
+```
+
+You should see `: keepalive` followed by `event: update` once the worker republishes a fresh candle.
 
 ## Standard Deployment / Operation
 

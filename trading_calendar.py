@@ -87,9 +87,12 @@ class TradingCalendar:
             return is_holiday
             
         except SQLAlchemyError as exc:
-            print(f"ERROR: Treating {target_date} as non-trading temporarily because holidays table lookup failed: {exc}")
-            # Do NOT cache the failure so it can auto-recover if DB comes back online
-            return True
+            print(
+                f"ERROR: Treating {target_date} as trading temporarily because holidays table lookup failed: {exc}"
+            )
+            # Fail open so the worker can keep publishing even if the holidays lookup is unavailable.
+            # Do NOT cache the failure so it can auto-recover if DB comes back online.
+            return False
 
     def is_trading_day(self, target_date: dt.date) -> bool:
         if target_date in self.holidays:
