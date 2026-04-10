@@ -4,8 +4,7 @@ import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
-from functools import partial
-from typing import Any, AsyncIterator, Dict, Set
+from typing import Any, AsyncIterator, Callable
 
 import redis
 import redis.asyncio
@@ -41,98 +40,209 @@ RAW_INDEX_SYMBOLS = {
     }
 }
 ALLOWED_INDEX_SYMBOLS = sorted(RAW_INDEX_SYMBOLS.keys())
+STREAM_CLIENT_QUEUE_SIZE = 50
+STREAM_RECONNECT_BACKOFF_SECONDS = 1.0
+STREAM_RECONNECT_MAX_BACKOFF_SECONDS = 5.0
 
-class PubSubManager:
-    def __init__(self, redis_url: str):
+
+class SharedPubSubManager:
+    def __init__(self, redis_url: str, *, queue_maxsize: int = STREAM_CLIENT_QUEUE_SIZE):
         self.redis_url = redis_url
+        self.queue_maxsize = queue_maxsize
+        self.listeners: dict[str, set[asyncio.Queue[str | None]]] = {}
         self._redis_client: redis.asyncio.Redis | None = None
         self._pubsub = None
-        
-        # Channel name -> set of asyncio.Queue
-        self.listeners: Dict[str, Set[asyncio.Queue]] = {}
-        self._listen_task: asyncio.Task | None = None
+        self._listener_task: asyncio.Task | None = None
+        self._subscribed_channels: set[str] = set()
+        self._subscription_changed = asyncio.Event()
+        self._state_lock = asyncio.Lock()
+        self._stopping = False
 
-    async def get_redis(self):
-        if self._redis_client is None:
-            self._redis_client = redis.asyncio.from_url(self.redis_url, decode_responses=True)
-        return self._redis_client
+    async def start(self) -> None:
+        async with self._state_lock:
+            self._stopping = False
+            if self._listener_task is None or self._listener_task.done():
+                self._listener_task = asyncio.create_task(self._listen_loop())
 
-    async def start(self):
-        if self._listen_task is not None:
+    async def stop(self) -> None:
+        async with self._state_lock:
+            self._stopping = True
+            self._subscription_changed.set()
+            task = self._listener_task
+            self._listener_task = None
+            self.listeners.clear()
+
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        async with self._state_lock:
+            await self._close_connection_locked()
+
+    async def subscribe(self, channel: str) -> asyncio.Queue[str | None]:
+        queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=self.queue_maxsize)
+        async with self._state_lock:
+            self.listeners.setdefault(channel, set()).add(queue)
+            self._stopping = False
+            if self._listener_task is None or self._listener_task.done():
+                self._listener_task = asyncio.create_task(self._listen_loop())
+            self._subscription_changed.set()
+        return queue
+
+    async def unsubscribe(self, channel: str, queue: asyncio.Queue[str | None]) -> None:
+        async with self._state_lock:
+            listeners = self.listeners.get(channel)
+            if listeners is None or queue not in listeners:
+                return
+            listeners.remove(queue)
+            if not listeners:
+                self.listeners.pop(channel, None)
+            self._subscription_changed.set()
+
+    async def _ensure_connection_locked(self) -> None:
+        if self._redis_client is not None and self._pubsub is not None:
             return
-        r = await self.get_redis()
-        self._pubsub = r.pubsub(ignore_subscribe_messages=True)
-        self._listen_task = asyncio.create_task(self._listen_loop())
+        self._redis_client = redis.asyncio.from_url(self.redis_url, decode_responses=True)
+        self._pubsub = self._redis_client.pubsub(ignore_subscribe_messages=True)
+        self._subscribed_channels.clear()
+        self._subscription_changed.set()
 
-    async def stop(self):
-        if self._listen_task:
-            self._listen_task.cancel()
-            self._listen_task = None
-        if self._pubsub:
-            await self._pubsub.close()
-            self._pubsub = None
-        if self._redis_client:
-            await self._redis_client.aclose()
-            self._redis_client = None
+    async def _close_connection_locked(self) -> None:
+        pubsub = self._pubsub
+        redis_client = self._redis_client
+        self._pubsub = None
+        self._redis_client = None
+        self._subscribed_channels.clear()
 
-    async def _listen_loop(self):
-        # Keeps reading from a single shared redis connection
+        if pubsub is not None:
+            try:
+                await pubsub.aclose()
+            except Exception:
+                pass
+        if redis_client is not None:
+            try:
+                await redis_client.aclose()
+            except Exception:
+                pass
+
+    async def _sync_subscriptions(self) -> None:
+        async with self._state_lock:
+            pubsub = self._pubsub
+            desired_channels = set(self.listeners)
+            current_channels = set(self._subscribed_channels)
+            self._subscription_changed.clear()
+
+        if pubsub is None:
+            return
+
+        to_add = sorted(desired_channels - current_channels)
+        to_remove = sorted(current_channels - desired_channels)
+
+        if to_add:
+            await pubsub.subscribe(*to_add)
+        if to_remove:
+            await pubsub.unsubscribe(*to_remove)
+
+        async with self._state_lock:
+            if pubsub is not self._pubsub:
+                self._subscription_changed.set()
+                return
+            self._subscribed_channels.update(to_add)
+            self._subscribed_channels.difference_update(to_remove)
+            if set(self.listeners) != self._subscribed_channels:
+                self._subscription_changed.set()
+
+    async def _disconnect_slow_client(self, channel: str, queue: asyncio.Queue[str | None]) -> None:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+        await self.unsubscribe(channel, queue)
+
+    async def _dispatch_message(self, channel: str, data: str) -> None:
+        async with self._state_lock:
+            listeners = list(self.listeners.get(channel, ()))
+
+        slow_clients: list[asyncio.Queue[str | None]] = []
+        for queue in listeners:
+            try:
+                queue.put_nowait(data)
+            except asyncio.QueueFull:
+                slow_clients.append(queue)
+
+        for queue in slow_clients:
+            await self._disconnect_slow_client(channel, queue)
+
+    async def _listen_loop(self) -> None:
+        backoff = STREAM_RECONNECT_BACKOFF_SECONDS
         try:
             while True:
-                if not self._pubsub.subscribed:
-                    await asyncio.sleep(0.1)
-                    continue
+                async with self._state_lock:
+                    if self._stopping:
+                        return
+                    await self._ensure_connection_locked()
+                    pubsub = self._pubsub
 
-                msg = await self._pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if msg and msg.get("type") == "message":
-                    channel = msg.get("channel", "")
-                    data = msg.get("data", "")
-                    if isinstance(data, (bytes, bytearray)):
-                        data = data.decode("utf-8", errors="replace")
-                        
-                    if channel in self.listeners:
-                        queues = list(self.listeners[channel])
-                        for q in queues:
+                try:
+                    while True:
+                        if self._stopping:
+                            return
+                        if self._subscription_changed.is_set():
+                            await self._sync_subscriptions()
+
+                        if pubsub is None:
+                            break
+
+                        if not self._subscribed_channels:
                             try:
-                                q.put_nowait(data)
-                            except asyncio.QueueFull:
-                                # Drop slow clients to prevent memory leaks
+                                await asyncio.wait_for(self._subscription_changed.wait(), timeout=1.0)
+                            except asyncio.TimeoutError:
                                 pass
+                            continue
+
+                        message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                        if not message or message.get("type") != "message":
+                            continue
+
+                        channel_name = _decode_pubsub_data(message.get("channel", ""))
+                        data = _decode_pubsub_data(message.get("data", ""))
+                        await self._dispatch_message(channel_name, data)
+
+                    backoff = STREAM_RECONNECT_BACKOFF_SECONDS
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    print(f"SharedPubSubManager listener error: {exc}")
+                    async with self._state_lock:
+                        await self._close_connection_locked()
+
+                    if self._stopping:
+                        return
+
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, STREAM_RECONNECT_MAX_BACKOFF_SECONDS)
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            print(f"PubSubManager listen loop error: {e}")
-
-    async def subscribe(self, channel: str) -> asyncio.Queue:
-        if self._pubsub is None:
-            await self.start()
-
-        if channel not in self.listeners:
-            self.listeners[channel] = set()
-            await self._pubsub.subscribe(channel)
-
-        # Buffer up to 100 messages for slow clients
-        q = asyncio.Queue(maxsize=100)
-        self.listeners[channel].add(q)
-        return q
-
-    async def unsubscribe(self, channel: str, q: asyncio.Queue):
-        if channel in self.listeners and q in self.listeners[channel]:
-            self.listeners[channel].remove(q)
-            if not self.listeners[channel]:
-                del self.listeners[channel]
-                if self._pubsub:
-                    await self._pubsub.unsubscribe(channel)
+        finally:
+            async with self._state_lock:
+                await self._close_connection_locked()
 
 
-broadcaster = PubSubManager(REDIS_URL)
+broadcaster = SharedPubSubManager(REDIS_URL)
+
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    # Startup
+    _ = application
     await broadcaster.start()
     yield
-    # Shutdown
     await broadcaster.stop()
     _SYNC_REDIS_POOL.disconnect()
 
@@ -242,6 +352,92 @@ def _normalize_index_pubsub_event(raw: str, symbol: str, token: str) -> dict[str
     }
 
 
+def _decode_pubsub_data(raw: Any) -> str:
+    if isinstance(raw, (bytes, bytearray)):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
+
+
+def _load_straddle_snapshot(symbol: str) -> str | None:
+    client = _redis_client()
+    try:
+        raw = client.get(current_key(symbol))
+    finally:
+        client.close()
+    return raw or None
+
+
+def _load_index_snapshot(symbol: str) -> str | None:
+    token = RAW_INDEX_SYMBOLS[symbol]["pubsub_token"]
+    client = _redis_client()
+    try:
+        raw = client.hget(source_hash_key(token), "__latest__")
+    finally:
+        client.close()
+    payload = _parse_latest_hash_payload(raw, token, symbol)
+    if payload is None:
+        return None
+    return json.dumps(payload, ensure_ascii=True)
+
+
+async def _stream_shared_channel(
+    channel: str,
+    formatter: Callable[[str], str | None],
+    snapshot_loader: Callable[[], str | None] | None = None,
+) -> AsyncIterator[str]:
+    queue = await broadcaster.subscribe(channel)
+    heartbeat_every = float(STRADDLE_STREAM_HEARTBEAT_SECONDS)
+    last_heartbeat = time.monotonic()
+    last_sent: str | None = None
+
+    try:
+        yield ": keepalive\n\n"
+
+        if snapshot_loader is not None:
+            snapshot = await asyncio.to_thread(snapshot_loader)
+            if snapshot is not None:
+                yield f"event: update\ndata: {snapshot}\n\n"
+                last_sent = snapshot
+                last_heartbeat = time.monotonic()
+
+        while True:
+            time_to_wait = max(0.0, heartbeat_every - (time.monotonic() - last_heartbeat))
+            try:
+                raw_data = await asyncio.wait_for(queue.get(), timeout=min(1.0, time_to_wait))
+            except asyncio.TimeoutError:
+                raw_data = "__timeout__"
+
+            if raw_data is None:
+                break
+
+            if raw_data != "__timeout__":
+                try:
+                    data = formatter(raw_data)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"SSE formatter error channel={channel}: {exc}")
+                    data = None
+
+                if data is not None and data != last_sent:
+                    yield f"event: update\ndata: {data}\n\n"
+                    last_sent = data
+                    last_heartbeat = time.monotonic()
+                    continue
+
+            now = time.monotonic()
+            if now - last_heartbeat >= heartbeat_every:
+                yield ": keepalive\n\n"
+                last_heartbeat = now
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"SSE stream error channel={channel}: {exc}")
+    finally:
+        try:
+            await asyncio.shield(broadcaster.unsubscribe(channel, queue))
+        except Exception:
+            pass
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -300,40 +496,13 @@ def get_straddle_history(
 @app.get("/straddle/stream/{symbol}")
 async def stream_straddle(symbol: str) -> StreamingResponse:
     symbol = _validate_symbol(symbol)
-    channel = update_channel(symbol)
-
-    async def event_stream() -> AsyncIterator[str]:
-        q = await broadcaster.subscribe(channel)
-
-        last_heartbeat = time.monotonic()
-        heartbeat_every = float(STRADDLE_STREAM_HEARTBEAT_SECONDS)
-
-        try:
-            yield ": keepalive\n\n"
-
-            while True:
-                time_to_wait = max(0.0, heartbeat_every - (time.monotonic() - last_heartbeat))
-                
-                try:
-                    data = await asyncio.wait_for(q.get(), timeout=min(1.0, time_to_wait))
-                    yield f"event: update\ndata: {data}\n\n"
-                    last_heartbeat = time.monotonic()
-                except asyncio.TimeoutError:
-                    now = time.monotonic()
-                    if now - last_heartbeat >= heartbeat_every:
-                        yield ": keepalive\n\n"
-                        last_heartbeat = now
-        except (asyncio.CancelledError, Exception) as e:
-             pass # normal when client disconnects
-        finally:
-            # Shield removal to prevent cancelled task from killing the unsubscribe hook
-            try:
-                await asyncio.shield(broadcaster.unsubscribe(channel, q))
-            except Exception:
-                pass
 
     return StreamingResponse(
-        event_stream(),
+        _stream_shared_channel(
+            update_channel(symbol),
+            lambda data: data,
+            snapshot_loader=lambda: _load_straddle_snapshot(symbol),
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -398,41 +567,17 @@ def get_index_history(
 async def stream_index(symbol: str) -> StreamingResponse:
     symbol = _validate_index_symbol(symbol)
     token = RAW_INDEX_SYMBOLS[symbol]["pubsub_token"]
-    channel = REDIS_PUBSUB_CHANNEL
-
-    async def event_stream() -> AsyncIterator[str]:
-        q = await broadcaster.subscribe(channel)
-
-        last_heartbeat = time.monotonic()
-        heartbeat_every = float(STRADDLE_STREAM_HEARTBEAT_SECONDS)
-
-        try:
-            yield ": keepalive\n\n"
-
-            while True:
-                time_to_wait = max(0.0, heartbeat_every - (time.monotonic() - last_heartbeat))
-
-                try:
-                    raw_data = await asyncio.wait_for(q.get(), timeout=min(1.0, time_to_wait))
-                    parsed = _normalize_index_pubsub_event(raw_data, symbol, token)
-                    if parsed:
-                        yield f"event: update\ndata: {json.dumps(parsed, ensure_ascii=True)}\n\n"
-                        last_heartbeat = time.monotonic()
-                except asyncio.TimeoutError:
-                    now = time.monotonic()
-                    if now - last_heartbeat >= heartbeat_every:
-                        yield ": keepalive\n\n"
-                        last_heartbeat = now
-        except (asyncio.CancelledError, Exception) as e:
-             pass # normal when user disconnects
-        finally:
-            try:
-                await asyncio.shield(broadcaster.unsubscribe(channel, q))
-            except Exception:
-                pass
 
     return StreamingResponse(
-        event_stream(),
+        _stream_shared_channel(
+            REDIS_PUBSUB_CHANNEL,
+            lambda data: (
+                json.dumps(parsed, ensure_ascii=True)
+                if (parsed := _normalize_index_pubsub_event(data, symbol, token)) is not None
+                else None
+            ),
+            snapshot_loader=lambda: _load_index_snapshot(symbol),
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
